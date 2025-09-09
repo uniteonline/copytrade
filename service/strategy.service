@@ -1,0 +1,29 @@
+[Unit]
+Description=CopyTrade Strategy Service
+After=network.target rabbitmq-server.service
+
+[Service]
+Type=simple
+# 如果你就是用 root 跑，就保留 root；否则换成实际存在的账户
+User=root
+
+# strategy.py 所在目录
+WorkingDirectory=/root/copyTrade/trade
+
+# 调用系统 python3
+ExecStart=/usr/bin/python3 /root/copyTrade/trade/strategy.py
+
+# 让 stdout/stderr 实时写入 journal
+Environment=PYTHONUNBUFFERED=1
+
+Restart=on-failure
+RestartSec=5
+
+# 提高文件描述符上限
+LimitNOFILE=65535
+
+StandardOutput=journal
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

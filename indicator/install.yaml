@@ -1,0 +1,47 @@
+rabbitmqadmin -u monitor -p 'P@ssw0rd' declare exchange name=ex.risk.eval type=direct durable=true
+rabbitmqadmin -u monitor -p 'P@ssw0rd' declare queue name=q.risk.eval.request durable=true
+rabbitmqadmin -u monitor -p 'P@ssw0rd' declare binding source=ex.risk.eval destination_type=queue destination=q.risk.eval.request routing_key=''
+
+
+rabbitmqadmin declare exchange name=ex.features type=topic durable=true
+rabbitmqadmin declare queue name=q.features.snapshot durable=true
+rabbitmqadmin declare binding source=ex.features destination_type=queue \
+  destination=q.features.snapshot routing_key="features.*"
+
+
+  [Unit]
+Description=Indicator + Risk RPC Service (OKX WS -> features -> MQ, plus RPC)
+Wants=network-online.target rabbitmq-server.service
+After=network-online.target rabbitmq-server.service
+
+[Service]
+Type=simple
+# 你的项目目录
+WorkingDirectory=/root/copyTrade/indicator
+# 如果你用系统 Python：
+ExecStart=/usr/bin/python3 -u app.py
+# 若有 venv，请改为：
+# ExecStart=/root/copyTrade/venv/bin/python -u app.py
+
+# 环境配置
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/root/copyTrade/indicator
+
+# 资源与重启策略
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+# 日志默认进 journal
+StandardOutput=journal
+StandardError=journal
+
+# (可选) 让进程收到 SIGTERM 时优雅退出（app.py 已注册信号处理）
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
+sudo systemctl daemon-reload
+sudo systemctl enable --now indicator.service
+sudo systemctl status indicator.service
+# 实时日志
+journalctl -u indicator.service -f

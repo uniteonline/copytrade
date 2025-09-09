@@ -1,0 +1,141 @@
+{
+  "BTC-USD-SWAP": {
+    "maxLever": "100",
+    "lotSz": 1.0,
+    "minSz": 1.0
+  },
+  "ETH-USD-SWAP": {
+    "maxLever": "100",
+    "lotSz": 1.0,
+    "minSz": 1.0
+  },
+  "SOL-USD-SWAP": {
+    "maxLever": "50",
+    "lotSz": 1.0,
+    "minSz": 1.0
+  },
+  "BTC-USDT-SWAP": {
+    "maxLever": "100",
+    "ctVal": 0.01,
+    "ctValCcy": "BTC",
+    "minSz": 0.01
+  },
+  "ETH-USDT-SWAP": {
+    "maxLever": "100",
+    "ctVal": 0.1,
+    "ctValCcy": "ETH",
+    "minSz": 0.01
+  },
+  "SOL-USDT-SWAP": {
+    "maxLever": "50",
+    "ctVal": 1.0,
+    "ctValCcy": "SOL",
+    "minSz": 0.01
+  },
+  "BNB-USDT-SWAP": {
+    "maxLever": "50",
+    "ctVal": 0.01,
+    "ctValCcy": "BNB",
+    "minSz": 1.0
+  },
+  "DOGE-USDT-SWAP": {
+    "maxLever": "50",
+    "ctVal": 1000.0,
+    "ctValCcy": "DOGE",
+    "minSz": 0.01
+  },
+  "SUI-USDT-SWAP": {
+    "maxLever": "50",
+    "ctVal": 1.0,
+    "ctValCcy": "SUI",
+    "minSz": 1.0
+  },
+  "XRP-USDT-SWAP": {
+    "maxLever": "50",
+    "ctVal": 100.0,
+    "ctValCcy": "XRP",
+    "minSz": 0.01
+  },
+  "MKR-USDT-SWAP": {
+    "maxLever": "50",
+    "ctVal": 0.01,
+    "ctValCcy": "MKR",
+    "minSz": 0.1
+  },
+  "TAO-USDT-SWAP": {
+    "maxLever": "50",
+    "ctVal": 0.01,
+    "ctValCcy": "TAO",
+    "minSz": 1.0
+  },
+  "HYPE-USDT-SWAP": {
+    "maxLever": "20",
+    "ctVal": 0.1,
+    "ctValCcy": "HYPE",
+    "minSz": 1.0
+  },
+  "FARTCOIN-USDT-SWAP": {
+    "maxLever": "20",
+    "ctVal": 1.0,
+    "ctValCcy": "FARTCOIN",
+    "minSz": 1.0
+  },
+  "SPX-USDT-SWAP": {
+    "maxLever": "50",
+    "ctVal": 1.0,
+    "ctValCcy": "SPX",
+    "minSz": 1.0
+  },
+  "PUMP-USDT-SWAP": {
+    "maxLever": "20",
+    "ctVal": 1000.0,
+    "ctValCcy": "PUMP",
+    "minSz": 1.0
+  },
+  "UNI-USDT-SWAP": {
+    "maxLever": "50",
+    "ctVal": 1.0,
+    "ctValCcy": "UNI",
+    "minSz": 1.0
+  },
+  "LTC-USDT-SWAP": {
+    "ctVal": 1.0,
+    "ctValCcy": "LTC",
+    "minSz": 0.1
+  },
+  "LDO-USDT-SWAP": {
+    "ctVal": 1.0,
+    "ctValCcy": "LDO",
+    "minSz": 1.0
+  },
+  "LINK-USDT-SWAP": {
+    "ctVal": 1.0,
+    "ctValCcy": "LINK",
+    "minSz": 0.1
+  },
+  "ZRO-USDT-SWAP": {
+    "ctVal": 1.0,
+    "ctValCcy": "ZRO",
+    "minSz": 1.0
+  },
+  "INJ-USDT-SWAP": {
+    "ctVal": 0.1,
+    "ctValCcy": "INJ",
+    "minSz": 1.0
+  },
+  "ARB-USDT-SWAP": {
+    "ctVal": 10.0,
+    "ctValCcy": "ARB",
+    "minSz": 0.1
+  },
+  "OP-USDT-SWAP": {
+    "ctVal": 1.0,
+    "ctValCcy": "OP",
+    "minSz": 1.0
+  },
+  "ZK-USDT-SWAP": {
+    "ctVal": 10.0,
+    "ctValCcy": "ZK",
+    "minSz": 1.0
+  }
+}

@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:schemas:indicator:feature.snapshot.v1",
+  "title": "feature.snapshot.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "type": { "const": "feature.snapshot" },
+    "svc": {
+      "type": "string",
+      "description": "发布方服务ID（如 indicator-svc-01）",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{2,64}$"
+    },
+    "ts": {
+      "type": "integer",
+      "description": "事件时间，毫秒时间戳",
+      "minimum": 0
+    },
+    "instId": {
+      "type": "string",
+      "description": "合约ID（USDT本位永续）",
+      "pattern": "^([A-Z0-9]+)-USDT-SWAP$"
+    },
+    "feat": {
+      "type": "object",
+      "description": "指标快照主体；已知字段按 $defs 校验，未知字段保留以便前向兼容",
+      "properties": {
+        "spread_bps": { "$ref": "#/$defs/bps" },
+        "mp": {
+          "type": "object",
+          "description": "Microprice 相关",
+          "additionalProperties": false,
+          "properties": {
+            "bidPx": { "$ref": "#/$defs/price" },
+            "askPx": { "$ref": "#/$defs/price" },
+            "midPx": { "$ref": "#/$defs/price" },
+            "microprice": { "$ref": "#/$defs/price" },
+            "delta_bps": { "$ref": "#/$defs/bpsSigned" },
+            "bias_same_side": { "type": "boolean" }
+          },
+          "required": ["midPx", "microprice", "delta_bps"]
+        },
+        "ofi": {
+          "type": "object",
+          "description": "Order Flow Imbalance（窗口与归一化值）",
+          "additionalProperties": false,
+          "properties": {
+            "window_ms": { "$ref": "#/$defs/posInt" },
+            "raw": { "type": "number" },
+            "norm": { "type": "number" },
+            "sign": { "type": "integer", "enum": [-1, 0, 1] },
+            "ts": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["window_ms", "norm"]
+        },
+        "qimb": {
+          "type": "object",
+          "description": "Queue imbalance（[−1,1]）",
+          "additionalProperties": false,
+          "properties": {
+            "value": { "type": "number", "minimum": -1, "maximum": 1 }
+          },
+          "required": ["value"]
+        },
+        "depth": {
+          "type": "object",
+          "description": "Top-N 聚合深度（可含 L5/L10 等）",
+          "additionalProperties": true,
+          "properties": {
+            "topN": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "bid_notional": { "type": "number", "minimum": 0 },
+                  "ask_notional": { "type": "number", "minimum": 0 }
+                },
+                "required": ["bid_notional", "ask_notional"]
+              }
+            }
+          }
+        },
+        "cvd": {
+          "type": "object",
+          "description": "CVD（按 taker side 累计）",
+          "additionalProperties": false,
+          "properties": {
+            "window_sec": { "$ref": "#/$defs/posInt" },
+            "value": { "type": "number" },
+            "delta": { "type": "number" },
+            "sigma": { "type": "number", "minimum": 0 }
+          },
+          "required": ["window_sec", "value"]
+        },
+        "profile": {
+          "type": "object",
+          "description": "Volume/Market Profile 锚点",
+          "additionalProperties": false,
+          "properties": {
+            "poc": { "$ref": "#/$defs/price" },
+            "vah": { "$ref": "#/$defs/price" },
+            "val": { "$ref": "#/$defs/price" },
+            "hvn": { "type": "array", "items": { "$ref": "#/$defs/price" }, "maxItems": 20 },
+            "lvn": { "type": "array", "items": { "$ref": "#/$defs/price" }, "maxItems": 20 }
+          },
+          "required": ["poc", "vah", "val"]
+        },
+        "vpin": {
+          "type": "object",
+          "description": "VPIN/毒性流（体积时钟）",
+          "additionalProperties": false,
+          "properties": {
+            "value": { "type": "number", "minimum": 0, "maximum": 1 },
+            "ewma": { "type": "number", "minimum": 0, "maximum": 1 },
+            "toxic": { "type": "boolean" }
+          },
+          "required": ["value"]
+        },
+        "state": {
+          "type": "object",
+          "description": "滚动分位与波动刻度",
+          "additionalProperties": false,
+          "properties": {
+            "p20": { "type": "number" },
+            "p80": { "type": "number" },
+            "p90": { "type": "number" },
+            "atr_pct": { "type": "number", "minimum": 0 },
+            "samples": { "$ref": "#/$defs/nonNegInt" },
+            "window_sec": { "$ref": "#/$defs/posInt" }
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "required": ["type", "svc", "ts", "instId", "feat"],
+  "$defs": {
+    "price": { "type": "number", "exclusiveMinimum": 0 },
+    "bps": { "type": "number", "minimum": 0 },
+    "bpsSigned": { "type": "number" },
+    "posInt": { "type": "integer", "minimum": 1 },
+    "nonNegInt": { "type": "integer", "minimum": 0 }
+  }
+}

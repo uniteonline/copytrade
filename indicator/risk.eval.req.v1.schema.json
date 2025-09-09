@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:schemas:indicator:risk.eval.req.v1",
+  "title": "risk.eval.req.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "type": { "const": "risk.eval.request" },
+    "svc": {
+      "type": "string",
+      "description": "请求方服务ID（如 trader-svc-01）",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{2,64}$"
+    },
+    "ts": { "type": "integer", "minimum": 0 },
+    "reqId": {
+      "type": "string",
+      "description": "请求ID（UUID或雪花ID）",
+      "minLength": 6,
+      "maxLength": 128
+    },
+    "instId": {
+      "type": "string",
+      "pattern": "^([A-Z0-9]+)-USDT-SWAP$"
+    },
+    "side": { "type": "string", "enum": ["BUY", "SELL"] },
+    "qty": {
+      "type": "number",
+      "description": "下单数量（合约张数或币量，与你的撮合侧口径一致）",
+      "exclusiveMinimum": 0
+    },
+    "ref": {
+      "type": "object",
+      "description": "可选参考价格/盘口摘要（非必须；评估服务会从本地快照取数）",
+      "additionalProperties": false,
+      "properties": {
+        "lastPx": { "type": "number", "exclusiveMinimum": 0 },
+        "midPx": { "type": "number", "exclusiveMinimum": 0 },
+        "spread_bps": { "type": "number", "minimum": 0 }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 64 },
+      "maxItems": 10
+    }
+  },
+  "required": ["type", "svc", "ts", "reqId", "instId", "side", "qty"]
+}

@@ -1,0 +1,175 @@
+# rules.yaml — 风控规则（分位阈值 & 动作映射）
+# 适配：rpc_eval.evaluate() 所读取的键
+# - vpin.block_when_toxic / vpin.split_thresholds
+# - spread.cap_bps
+# - microprice.max_abs_offset_bps
+# - ofi.direction_confirm / ofi.window_ms
+# - split.base / split.max
+# - response.default_ttl_ms
+# 说明：
+# • “bps” 一律指基点（1 bps = 0.01%）
+# • Pxx 分位来自 state.py 的滚动分位（同一会话内滚动更新）
+# • 可以按标的在 per_instrument 下覆写
+
+version: 1
+updated: "2025-08-11"
+
+# ===== 全局默认（可被每标的覆盖）=====
+defaults:
+  # —— 统计口径来源 —— #
+  quantiles:
+    # state.py 对每个 instId 维护滚动分位：spread_bps / mp_delta_bps / ofi_norm 等
+    # 这里声明我们用到哪些 key 以便审计
+    use:
+      - spread_bps             # 当前点差（中值缩放后转 bps）
+      - mp_delta_bps           # 微价格相对 mid 的偏差，转 bps
+      - ofi_norm               # OFI 归一化（按 TopN/ATR 校准）
+      - cvd_sigma              # CVD 背离强度（sigma）
+      - atr_pct                # ATR%（波动度刻度）
+    pctl:
+      warn: p80                # ≥P80 视为“偏高”
+      risk: p90                # ≥P90 视为“过高”
+  # —— VPIN（毒性流） —— #
+  vpin:
+    enabled: true
+    block_when_toxic: true            # 一旦毒性判定为真 → 直接拒单（allow=false）
+    toxic_threshold: 0.82             # ≥ 阈值视为 toxic（EWMA 或 MA）
+    # VPIN 升高时建议拆单的档位（阈值, 建议子单数量）
+    split_thresholds:
+      - [0.70, 2]
+      - [0.78, 3]
+      - [0.85, 5]
+  # —— 点差防护 —— #
+  spread:
+    cap_bps: 15.0                     # 点差“硬上限”参考值（过宽时加大报价偏移）
+    widen_on_pctl:
+      warn: true                      # ≥P80：至少取 ½*spread 作为偏移基线
+      risk: true                      # ≥P90：同上，并打上 notes: spread_wide
+  # —— 微价格（Microprice）偏移 —— #
+  microprice:
+    max_abs_offset_bps: 12.0          # |mp_delta_bps| 的夹限（防极端）
+    # 价格偏移的方向性（BUY 用正偏移、SELL 用负偏移的“正值部分”）
+    use_bias: true
+  # —— OFI 方向一致性 —— #
+  ofi:
+    direction_confirm: true           # 需要 OFI 符号与下单方向一致
+    window_ms: 1000                   # 与 features.windows.ofi_ms 对齐（默认 1s）
+    oppose_action:
+      widen_offset_floor_bps: 1.0     # 反向时至少加 1 bps 偏移
+      min_split: 2                    # 并建议拆 2 单起
+  # —— CVD 背离预警 —— #
+  cvd:
+    divergence:
+      enabled: true
+      min_sigma: 2.0                  # ≥ 2σ 视为显著背离
+      widen_offset_bps: 2.0
+      min_split: 2
+  # —— 结构锚点（Volume/Market Profile） —— #
+  profile:
+    use: true
+    value_area_pct: 0.70              # VA 定义（70%）
+    # 与 POC/VAH/VAL 的邻近阈值（以 bps 表示距离）
+    near:
+      poc_bps: 5.0
+      vah_val_bps: 8.0
+    actions:
+      bounce:                         # 贴近 VAH/VAL 且 OFI 反向时 → 倾向反弹
+        widen_offset_bps: 1.0
+        min_split: 2
+      break:                          # 贴近且 OFI 同向 + mp_bias 同向 → 可能突破
+        min_split: 3
+  # —— 拆单与响应 —— #
+  split:
+    base: 1
+    max: 8
+  response:
+    default_ttl_ms: 120
+
+# ===== 决策表（顺序匹配；先命中的生效）=====
+decision_table:
+  # 1) VPIN 毒性：直接拒单
+  - when:
+      vpin.toxic: true
+    then:
+      allow: false
+      notes: ["blocked_vpin_toxic"]
+
+  # 2) 点差过宽（≥P90 或 >cap）：至少取 ½*spread 偏移；仍允许下单
+  - when:
+      spread.is_risk: true            # spread_bps ≥ P90
+    then:
+      allow: true
+      priceOffsetBps: ">=spread.bps/2"
+      notes: ["spread_wide"]
+
+  # 3) OFI 与方向一致：使用（夹限后的）微价格偏移作为建议偏移
+  - when:
+      ofi.sign_confirms: true
+    then:
+      allow: true
+      priceOffsetBps: "+microprice.bias_clamped"
+      notes: ["ofi_confirm"]
+
+  # 4) OFI 反向：提高偏移下限，并建议增加切片
+  - when:
+      ofi.sign_confirms: false
+    then:
+      allow: true
+      priceOffsetBps: "max(., ofi.oppose_floor_bps)"  # 以 oppose_action.widen_offset_floor_bps 为下限
+      split: ">=2"
+      notes: ["ofi_opposes_side"]
+
+  # 5) CVD 显著背离：进一步加偏移并提升最小拆单
+  - when:
+      cvd.divergent: true
+    then:
+      allow: true
+      priceOffsetBps: "max(., cvd.widen_offset_bps)"
+      split: ">=2"
+      notes: ["cvd_div"]
+
+  # 6) 贴近结构锚点：按 bounce/break 提示拆单或偏移（不改变 allow）
+  - when:
+      profile.near: "VAH|VAL"
+      ofi.sign_confirms: false
+    then:
+      allow: true
+      priceOffsetBps: "max(., profile.actions.bounce.widen_offset_bps)"
+      split: ">=profile.actions.bounce.min_split"
+      notes: ["profile_bounce_bias"]
+  - when:
+      profile.near: "VAH|VAL"
+      ofi.sign_confirms: true
+      microprice.bias_same_side: true
+    then:
+      allow: true
+      split: ">=profile.actions.break.min_split"
+      notes: ["profile_break_bias"]
+
+  # 7) 默认：允许；偏移为（夹限微价格偏移，与½*spread 的更大者），并尊重 cap
+  - default:
+      allow: true
+      priceOffsetBps: "max(microprice.bias_clamped, spread.bps/2)"
+      notes: ["default_rule"]
+
+# ===== 分市场（标的）覆盖 =====
+per_instrument:
+  BTC-USDT-SWAP:
+    vpin:
+      toxic_threshold: 0.80            # BTC 流动性更深，阈值略放宽
+    spread:
+      cap_bps: 12.0
+    ofi:
+      window_ms: 1000
+  ETH-USDT-SWAP:
+    spread:
+      cap_bps: 14.0
+    ofi:
+      window_ms: 1000
+  SOL-USDT-SWAP:
+    vpin:
+      toxic_threshold: 0.84            # SOL 更易“拉扯”，阈值略收紧
+    spread:
+      cap_bps: 20.0
+    ofi:
+      window_ms: 1000

@@ -1,0 +1,42 @@
+{
+  "ETH-USDT-SWAP": {
+    "ctVal": 0.1,
+    "ctValCcy": "ETH",
+    "minSz": 0.01
+  },
+  "ARB-USDT-SWAP": {
+    "ctVal": 10.0,
+    "ctValCcy": "ARB",
+    "minSz": 0.1
+  },
+  "LINK-USDT-SWAP": {
+    "ctVal": 1.0,
+    "ctValCcy": "LINK",
+    "minSz": 0.1
+  },
+  "LDO-USDT-SWAP": {
+    "ctVal": 1.0,
+    "ctValCcy": "LDO",
+    "minSz": 1.0
+  },
+  "AAVE-USDT-SWAP": {
+    "ctVal": 0.1,
+    "ctValCcy": "AAVE",
+    "minSz": 0.1
+  },
+  "BTC-USDT-SWAP": {
+    "ctVal": 0.01,
+    "ctValCcy": "BTC",
+    "minSz": 0.01
+  },
+  "ADA-USDT-SWAP": {
+    "ctVal": 100.0,
+    "ctValCcy": "ADA",
+    "minSz": 0.1
+  },
+  "HYPE-USDT-SWAP": {
+    "ctVal": 0.1,
+    "ctValCcy": "HYPE",
+    "minSz": 1.0
+  }
+}

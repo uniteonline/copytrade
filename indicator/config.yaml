@@ -1,0 +1,68 @@
+# config.yaml
+service:
+  id: indicator-svc-01
+  log_level: INFO
+storage:
+  # SQLite 缓存文件（可自定路径）
+  sqlite_path: /root/copyTrade/indicator/okx_cache.db
+  store_raw_trades: false    # 只保留聚合
+okx:
+  ws_url: wss://ws.okx.com:8443/ws/v5/public
+  auth:
+    api_key: "xxx"
+    secret_key: "xxx"
+    passphrase: "xxx" 
+  channels:
+    orderbook: books
+    trades: trades
+    tickers: tickers
+  instIds: [BTC-USDT-SWAP, ETH-USDT-SWAP, SOL-USDT-SWAP]
+  rest_rate_limits:
+    history-trades: { rps: 10, burst: 20 }
+    candles: { rps: 8, burst: 16 }
+features:
+  windows:
+    ofi_ms: 1000
+    cvd_sec: 60
+    quantile_lookback_min: 60
+    profile_ms: 0  # 单窗关闭，改用多时段 MultiProfile
+  depth_levels: [5, 10]
+  profile:
+    session: "none"
+    vp_sample_ms: 60000
+    step: 0.2           # BTC示例，自行按品种调整
+    use_quote: false
+    steps_by_inst:
+      SOL-USDT-SWAP: 0.01   # 单独把 SOL 的 bin 更细
+    tpo_sample_ms: 30000
+    window_max_minutes: 960
+    bootstrap_minutes: 4320        # ↑ 启动先尽量抓满最长窗（72h）
+    bootstrap_trade_pages: 0       # 0=不设页数上限（内部仍有硬上限保护）
+    emit_nodes: true               # 输出 HVN/LVN 节点
+    multi_windows_minutes: [480, 960, 1440, 4320]   # 8h / 16h / 24h / 72h
+    #multi_windows_minutes: [ 4320]   #首次回补只激活最长窗
+    labels: ["8h", "16h", "24h", "72h"]
+    #labels: ["72h"]
+    # —— 方案A：全窗回灌（重启后先把 72h 回灌满再启动 WS）——
+    bootstrap_mode: full         # full | gap
+    bootstrap_flush_minutes: 240   # ← 四小时
+    fast_start_if_covered: true   # 覆盖已达目标时，跳过回补，直接开WS
+    fast_subscribe_per_inst: true     # ⭐ 新增：某标的回补完就订阅该标的 WS
+
+  vpin:
+    enabled: true
+mq:
+  host: "amqp://monitor:P%40ssw0rd@127.0.0.1:5672/%2F"
+  exchanges:
+    features: ex.features
+    risk_eval: ex.risk.eval
+    health: ex.ops.health
+  queues:
+    eval_req: q.risk.eval.request      # TTL=100ms, DLX=ex.dlx
+    feature_snapshot: q.features.snapshot
+    feature_snapshot_eval: q.features.eval
+    status_events: status.events
+    snapshot_req: q.snapshot.req
+  prefetch: 10
+  publisher_confirms: true
+  heartbeat: 30

@@ -1,0 +1,31 @@
+[Unit]
+Description=Indicator + Risk RPC Service (OKX WS -> features -> MQ, plus RPC)
+Wants=network-online.target rabbitmq-server.service
+After=network-online.target rabbitmq-server.service
+
+[Service]
+Type=simple
+# 你的项目目录
+WorkingDirectory=/root/copyTrade/indicator
+# 如果你用系统 Python：
+ExecStart=/usr/bin/python3 -u app.py
+# 若有 venv，请改为：
+# ExecStart=/root/copyTrade/venv/bin/python -u app.py
+
+# 环境配置
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/root/copyTrade/indicator
+
+# 资源与重启策略
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+# 日志默认进 journal
+StandardOutput=journal
+StandardError=journal
+
+# (可选) 让进程收到 SIGTERM 时优雅退出（app.py 已注册信号处理）
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

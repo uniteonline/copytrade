@@ -1,0 +1,7 @@
+indicator/okx_cache.db-wal
+indicator/okx_cache.db
+indicator/okx_cache.db-shm
+/root/copyTrade/.dockerignore
+/root/copyTrade/docker-compose.yml
+/root/copyTrade/.env
+/root/copyTrade/Dockerfile

@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:schemas:indicator:risk.eval.rsp.v1",
+  "title": "risk.eval.rsp.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "type": { "const": "risk.eval.reply" },
+    "svc": {
+      "type": "string",
+      "description": "响应方服务ID（indicator-svc-01）",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{2,64}$"
+    },
+    "ts": { "type": "integer", "minimum": 0 },
+    "reqId": {
+      "type": "string",
+      "description": "原请求ID回显",
+      "minLength": 6,
+      "maxLength": 128
+    },
+    "instId": {
+      "type": "string",
+      "pattern": "^([A-Z0-9]+)-USDT-SWAP$"
+    },
+    "allow": { "type": "boolean" },
+    "priceOffsetBps": {
+      "type": "number",
+      "description": "建议报价相对 mid 的偏移（bps，正=买单抬价/卖单降价）"
+    },
+    "split": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 64,
+      "description": "建议拆分子单数"
+    },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 64 },
+      "maxItems": 16
+    },
+    "debug": {
+      "type": "object",
+      "description": "可选调试/审计字段（阈值命中、分位位点、关键特征值等）",
+      "additionalProperties": true
+    }
+  },
+  "required": ["type", "svc", "ts", "reqId", "instId", "allow"]
+}

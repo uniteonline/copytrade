@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+env/
+venv/
+dist/
+build/
+
+# 数据/日志/缓存（按需增删）
+logs/
+*.log
+nohup.out
+data/
+cache/
+checkpoints/
+models/
+
+# SQLite 运行时文件（你之前的问题核心）
+indicator/okx_cache.db
+indicator/okx_cache.db-shm
+indicator/okx_cache.db-wal

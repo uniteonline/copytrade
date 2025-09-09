@@ -1,0 +1,106 @@
+okx:
+  api_key: "xxx"
+  secret_key: "xxx"
+  passphrase: "xxx*" 
+  leverage_mode: "triple" # max | normal | double | triple
+
+#dogleave
+
+rabbitmq:
+  url: "amqp://monitor:P%40ssw0rd@127.0.0.1:5672/%2F"
+  queue_ops: queue_ops
+  queue_info: queue_info
+  prefetch: 10   
+  status_events: status.events
+  queue_snap_req: queue_snap_req
+  volume_profile: q.snapshot.req
+  heartbeat: 30
+
+# ----------------------------------------------------------------
+# 新增：风险 / 资金管理参数（如不需要可整段删除，代码会用默认值）
+# ----------------------------------------------------------------
+risk:
+  reserve_ratio: 0.35        # 保底余额占可用余额的比例
+  reserve_min_usdt: 100.0     # 最低保底 USDT
+  budget_ratio: 0.35         # 单次建仓占可动用资金比例
+  entry_slip_ratio: 0.0045   # 0.4% 滑点；填 0 表示禁用
+  max_drawdown_ratio: 150
+  profit_step_pct: 0      # 关闭固定ROE阶梯（改用ATR动态）
+  profit_step_tolerance_pct: 0
+  profit_cut_pct: 70      # 作为“基准减仓比例”，实际会按波动自适应缩放
+  # —— 亏损保护（按浮亏分档减仓）——
+  loss_step_pct: 40                # 每满 35% 浮亏触发一次（示例）
+  lp_cuts: [0.15, 0.25, 0.40, 0.50]
+  loss_step_tolerance_pct: 1       # 容差；1=按目标的99%触发
+  loss_cut_pct: 25                 # 触发时减仓 25%
+  min_roe_gap_pct: 30.0     # HVN 用
+  lp_step_pct: 40.0         # LVN 用（亏损侧最小间距）
+  min_roe_gap_pct: 30      # RG 里的最小 ROE 距离（%）
+  trigger_px_tolerance_pct: 0   # 价格去重容差；也可留 0 交给 ATR 自适应
+  loss_cut_mode: current
+  PP_CUTS: [0.25,0.5,0.40]
+  node_tp_cuts: [0.15, 0.25, 0.40, 0.50]      # 真实 HVN 的前几档可自定义（不写则默认走 lp_cuts）
+  node_sl_cuts: [0.25,0.5,0.40]      # 真实 LVN 的前几档可自定义（不写则默认走 PP_CUTS）
+  node_synth_enable: true
+  node_synth_tolerance_pct: 1     # “差 <5pp”视为到达目标档（如 58%≈60%）
+  node_synth_max_levels: 5        # 最多补到第 5 档
+  node_synth_cut_pct: 40          # 补出的档位默认 30% 减仓
+  node_confirm_k_atr: 0.5
+  node_confirm_min_pct: 0.2
+  entry_slip:                # 新增：动态滑点开关与参数
+    mode: atr                # atr | fixed（回退）
+    atr_k: 0.95              # 滑点 = atr_k × ATR%（再做上下限与地板约束）
+    min_pct: 0.0001          # 0.02% 下限（分数表示）
+    max_pct: 0.004           # 0.5% 上限
+    spread_mult: 1.0         # 至少达到 1.5 × 当前价差（可选）
+    tick_mult: 1             # 至少 2 个最小变动价位（可选）
+    abs_floor_usdt: 0.2        # 绝对 USDT 地板，避免太小（可选）
+
+volatility:
+  bar: "3m"                     # 切到3m
+  atr_period: 20                # 更稳的短周期ATR
+  atr_median_lookback_bars: 480 # 3m×480≈1天
+  vol_factor_min: 0.7           # vol_factor下限：过小波动不无限放大
+  vol_factor_max: 1.6           # vol_factor上限：极端波动不无限缩小
+  pos_scale_min: 0.6            # 仓位缩放下限（波动大时最多缩到60%）
+  pos_scale_max: 1.3            # 仓位放大上限（波动小时最多放到130%）
+  cut_scale_min: 1.0            # 每次减仓比例的缩放下限
+  cut_scale_max: 1.0            # 每次减仓比例的放大上限
+  dd_scale_min: 0.8             # 最大回撤阈值的缩放下限
+  dd_scale_max: 1.6             # 最大回撤阈值的放大上限
+  trigger_px_k_atr: 0.7         # 价格去重容差= max(配置容差, k * ATR%)
+  cache_ttl_sec: 20             # ATR缓存TTL，降低API频率
+  # —— ATR驱动的收益阶梯（无需额外开关）——
+  pp_atr_k: 2.0                # 单档步长 ≈ lev × ATR% × k
+  pp_step_min_roe: 30.0        # 每档最小ROE阈值（%）
+  pp_step_max_roe: 140.0       # 每档最大ROE阈值（%）
+  lp_step_min_roe: 35.0        #动态止损第一档的百分比 
+  
+filter_tokens:
+  - PENDLE
+  - SEI
+  - ENA
+
+
+
+info_interval_sec: 2.0
+# 新增：INFO 仅在 mid 价相对上次推送变动 ≥ 该百分比时才发送（0=关闭）
+# 例：0.03 = 0.03%
+info_px_min_move_pct: 0.03
+
+entry_protect:
+  enable: true
+  window_sec: 480          # 回看窗口，默认 8 分钟
+  bar: "1m"                # 取 1m K 线
+  trigger_drop_k_atr: 2.5  # 达到 2.5×ATR% 判定为急跌
+  saturate_drop_k_atr: 5.0 # 5×ATR% 视为“最严重”，权重饱和
+  max_extra_shift_pct: 6.0 # 基线价最多再便宜 1.6%（做空则最多再贵 1.6%）
+  anchor_band_k_atr: 0.2   # 在极值外再预留 0.2×ATR% 的保护带
+  blend_gamma: 1.4         # 严重度→权重的凸性（越大越保守）
+
+follow:
+  enable: true                 # 若你要做开关，也可在 trade.py 里控制
+  dist_bps: 50                 # 目标安全距离=0.50%（可按你的“保持距离”偏好微调）
+  slip_shrink_max: 0.5        # 最多削减 1/3 滑点（与你提出的“2分之一”一致）
+  ioc_threshold: 0.7           # 距离达到目标的 70% 就用 IOC，一跳跟；要更保守可设 0.9
+  min_slip_pct: 0.0001            # 滑点地板（分数），如 0.0002=2bp；不需要可留 0

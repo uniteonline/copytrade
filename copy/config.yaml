@@ -1,0 +1,24 @@
+# 要监控的钱包地址，随时增删
+users:
+
+  - dogleave: "0xfeb3821ebccf27f7d024f4b0ae8dd6e8c685e248"
+  - dogleave_alt: "0xb39df6c5f0ef3a6e97f9ea5585f756f210fb0b99"
+  
+
+mq_watch:
+  - dogleave
+
+rabbitmq:
+  url: "amqp://monitor:P%40ssw0rd@127.0.0.1:5672/%2F"
+  prefetch: 10       # 策略层一次最多并发处理 10 条
+  queue_ops: queue_ops
+  queue_info: queue_info
+  queue_snap_req:  queue_snap_req    
+  heartbeat: 30  
+
+telegram:
+  token:  "xx:xxx"
+  chats:          # 允许一对多，按钱包或 user 映射到 chat_id
+    me: 7898115045    
+    friends:   578557101
+    wubi: 7933302472

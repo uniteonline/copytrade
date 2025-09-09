@@ -1,0 +1,23 @@
+# /etc/systemd/system/watcher.service
+[Unit]
+Description=Hyperliquid Position Watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Python 解释器直接调用你的脚本
+ExecStart=/usr/bin/python3 /root/copyTrade/copy/watcher.py
+# 将工作目录设为项目根，方便脚本内部使用相对路径
+WorkingDirectory=/root/copyTrade/copy
+# 使用系统环境变量，必要时可在此追加 EnvFile 或 Environment=
+Environment=PYTHONUNBUFFERED=1
+# 崩溃后 5 秒自动重启，避免连环重启风暴
+Restart=on-failure
+RestartSec=5
+# 限制尝试次数，防止反复失败后刷屏
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+[Install]
+WantedBy=multi-user.target

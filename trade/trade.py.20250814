@@ -1,0 +1,3224 @@
+import os
+import yaml
+import logging
+import math      
+import time, random, functools
+import re
+import sys
+import uuid
+import pika
+import threading
+from math import isfinite
+# -------------------------------------------------------------
+# 屏蔽 python-okx SDK 打印的「HTTP Request: …」调试日志
+# ＊要写在第一次 import okx.* 之前，否则已创建的 logger
+#   级别不会被更新
+# -------------------------------------------------------------
+for noisy in ("okx", "httpx", "urllib3"):   # httpx / urllib3 视 SDK 版本而定
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+# ===== 我们自己的日志级别（不改你的业务逻辑）=====
+# 根 logger 至少 INFO，本模块 DEBUG，便于排查
+root_logger = logging.getLogger()
+if root_logger.level > logging.INFO:
+    root_logger.setLevel(logging.INFO)
+# 本模块更细：DEBUG
+logging.getLogger(__name__).setLevel(logging.DEBUG)
+# ================= 全局开关 =================
+# "real"：真实下单；"test"：只打印最终参数，不发送订单
+mode = "real"
+
+import okx.Account as Account        # 账户与余额、杠杆设置接口
+import okx.MarketData as MarketData  # 市场数据接口，包括交易对查询
+import okx.PublicData  as PublicData 
+from okx.Trade import TradeAPI
+import json, pathlib
+import math
+from typing import Dict, Any, DefaultDict, Tuple, Callable
+from collections import defaultdict
+from contextlib import suppress
+from risk_guardian import RiskGuardian, quick_eval_from_event
+from utils import peek_features_snapshot,rpc_indicator_snapshot
+
+class OKXTradingClient:
+
+    def __init__(
+        self,
+        flag: str = "0",            # "0"=实盘；"1"=模拟
+        margin_mode: str = "cross", # 全仓 cross；逐仓 isolated
+        leverage: str = "100",      # 默认 100X（仅作兜底）
+        pos_mode: str = "long_short",      # "net" | "long_short"
+        leverage_mode: str = "max",        # ← 新增：杠杆策略  max | normal | double
+    ):
+        """
+        初始化：从同目录下的 config.yaml 加载 OKX API 配置，
+        并创建 Account、MarketData、Trade 三大 API 实例
+        """
+        # 1. 定位并读取 config.yaml
+        config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+
+        okx_cfg = cfg.get("okx", {})
+        api_key     = okx_cfg.get("api_key")
+        secret_key  = okx_cfg.get("secret_key")
+        passphrase  = okx_cfg.get("passphrase")
+
+        if not (api_key and secret_key and passphrase):
+            raise ValueError("请在 config.yaml 中配置完整的 okx.api_key、secret_key 和 passphrase")
+        self._api_key, self._secret_key, self._passphrase = api_key, secret_key, passphrase
+        # 2) 保存模式参数（允许 config.yaml 覆盖）
+        self.flag        = flag
+        self.margin_mode = okx_cfg.get("margin_mode", margin_mode)
+        self.leverage    = str(okx_cfg.get("leverage", leverage))
+        _LEV_MODES = {"max", "normal", "double"}
+        cfg_lev_mode = (okx_cfg.get("leverage_mode") or leverage_mode).lower()
+        if cfg_lev_mode not in _LEV_MODES:
+            raise ValueError(f"leverage_mode 必须为 {_LEV_MODES} 之一（got {cfg_lev_mode})")
+        self.leverage_mode = cfg_lev_mode
+        # 保存 flag 供 _rebuild_clients() 使用
+        self.flag = flag
+        # -------- local ↔︎ API 枚举映射 -------- #
+        _LOCAL2API = {"net": "net_mode", "long_short": "long_short_mode"}
+        _API2LOCAL = {v: k for k, v in _LOCAL2API.items()}
+
+        pos_mode = (okx_cfg.get("pos_mode", pos_mode)).lower()
+        if pos_mode not in _LOCAL2API:
+            raise ValueError(f"pos_mode must be 'net' or 'long_short' (got {pos_mode})")
+        self.pos_mode = pos_mode            # 本地语义
+        # -------------------------------------------------------
+        # 资金管理参数：从 config.yaml 的 risk 节读取，如无则用默认
+        # -------------------------------------------------------
+        risk_cfg = cfg.get("risk", {})
+        self.RESERVE_RATIO    = float(risk_cfg.get("reserve_ratio",0.25))
+        self.RESERVE_MIN_USDT = float(risk_cfg.get("reserve_min_usdt",25))
+        self.BUDGET_RATIO     = float(risk_cfg.get("budget_ratio",0.25))
+        # -------- 最大回撤（按 ROE 百分比）阈值（≤0 关闭） -------- #
+        # 例如：40 → 触发于 ROE -40%
+        self.MAX_DD_ROE_PCT = float(risk_cfg.get("max_drawdown_ratio", 40.0))
+
+        # -------- 入场滑点（0 表示不用） -------- #
+        # 支持在 config.yaml 根级或 risk 段里配置 entry_slip_ratio
+        self.ENTRY_SLIP       = float(cfg.get("entry_slip_ratio",
+                                    risk_cfg.get("entry_slip_ratio", 0)))
+        # -------- 新增：收益保护（0 表示关闭） -------- #
+        # profit_step_pct：每满多少 % 收益触发一次（如 80 = 80%）
+        # profit_cut_pct ：触发减仓百分比（如 30 = 减 30%）
+        self.PP_STEP_PCT      = float(risk_cfg.get("profit_step_pct", 0))
+        self.PP_CUT_RATIO     = float(risk_cfg.get("profit_cut_pct", 0)) / 100.0
+        # 触发容差：例如 1 表示达到目标阶梯的 99% 也触发
+        self.PP_TOLERANCE_PCT = float(risk_cfg.get("profit_step_tolerance_pct", 0.0))
+        # -------- 新增：止损保护（分档减仓，0 表示关闭） -------- #
+        # loss_step_pct：每满多少 % 浮亏触发一次（如 10 = 每亏 10%）
+        # loss_cut_pct ：触发减仓百分比（如 25 = 减 25%）
+        self.LP_STEP_PCT      = float(risk_cfg.get("loss_step_pct", 0))
+        self.LP_CUT_RATIO     = float(risk_cfg.get("loss_cut_pct", 0)) / 100.0
+        self.LP_TOLERANCE_PCT = float(risk_cfg.get("loss_step_tolerance_pct", 0.0))
+        # -------- 触发价格去重的相对容差（百分比，0=关闭） -------- #
+        # 同一 instId/posSide 若 midPx 与上次触发价在此容差内，则视为“同一价格点”，不重复触发
+        self.TRIGGER_PX_TOL_PCT = float(risk_cfg.get("trigger_px_tolerance_pct", 0.0))
+        # 优化 9：tol% × f(level) → 线性/自定义因子
+        self.PX_LVL_K = float(risk_cfg.get("trigger_px_level_k", 0.25))   # f(level)=1+K*(lvl-1)
+        self.PX_LVL_FACTORS = list(map(float, risk_cfg.get("trigger_px_level_factors", [])))  # 可选：显式数组
+        # ---- RiskGuardian：最小 ROE 距离（传实盘杠杆用来换算价格间距） ----
+        self.RG_MIN_ROE_GAP_PCT = float(risk_cfg.get("min_roe_gap_pct", 30.0))
+        # -------- 过滤币种：支持数组或逗号分隔字符串 -------- #
+        raw_flt = cfg.get("filter_tokens", []) or []
+        self.FILTER_TOKENS: set[str] = self._normalize_token_filter(raw_flt)
+        logging.info("过滤币种源类型=%s → 生效：%s",
+                     type(raw_flt).__name__, ",".join(sorted(self.FILTER_TOKENS)) or "(空)")
+        logging.info("Leverage config → mode=%s, base=%sx, margin_mode=%s",
+                     self.leverage_mode, self.leverage, self.margin_mode)
+        # 3. 初始化各 API 客户端
+        self.account_api = Account.AccountAPI(api_key, secret_key, passphrase, False, flag)
+        self.market_api  = MarketData.MarketAPI(flag=flag)
+        self.public_api  = PublicData.PublicAPI(flag=flag)
+        self.trade_api   = TradeAPI(api_key, secret_key, passphrase, False, flag)
+
+        # 4. 本地缓存：订单 & 仓位
+        self.orders: Dict[str, Dict[str, Any]] = {}
+        self._bootstrap_open_orders()   # 未成交委托
+        self._bootstrap_positions()     # 已持仓信息
+        # 每个实例自己的 positions TTL 缓存，避免类属性在多实例间共享
+        self._pos_cache = {"ts": 0.0, "data": []}
+        # 单飞锁：保证同一时刻只有一个线程会真正请求 positions
+        self._pos_lock = threading.Lock()
+        # 客户端重建节流
+        self._rebuild_lock = threading.Lock()
+        self._last_rebuild = 0.0
+        # 5. 运行时缓存：交易对 & 钱包端仓位价值
+        self._pair_cache: Dict[str, str]      = {}            # coin -> instId
+        self._wallet_value: DefaultDict[str, float] = defaultdict(float)  # coin -> abs(szi)*entryPx
+
+        # 6. 交易对参数本地缓存（maxLever / lotSz / minSz）---- #
+        self._spec_cache_path = pathlib.Path(__file__).with_name("inst_spec_cache.json")
+        self._spec_cache: Dict[str, Dict[str, str]] = self._load_spec_cache()
+        self._spec_lock  = self._spec_cache_path.with_suffix(".lock")
+        # ---------- 杠杆缓存 ---------- #
+        self._lev_cache_path = pathlib.Path(__file__).with_name("lev_cache.json")
+        self._lev_cache: Dict[str, int] = self._load_leverage_cache()
+        # ---------- 新增：收益保护触发层级持久化 ---------- #
+        self._pp_state_path = pathlib.Path(__file__).with_name("profit_guard_state.json")
+        self._pp_hits: Dict[str, int] = self._load_profit_guard_state()
+        # ---------- 新增：止损保护触发层级持久化 ---------- #
+        self._lp_state_path = pathlib.Path(__file__).with_name("loss_guard_state.json")
+        self._lp_hits: Dict[str, int] = self._load_loss_guard_state()
+        # ---------- 新增：同一价格点去重（可持久化） ---------- #
+        self._pp_px_path = pathlib.Path(__file__).with_name("profit_guard_px.json")
+        self._lp_px_path = pathlib.Path(__file__).with_name("loss_guard_px.json")
+        self._pp_last_px: Dict[str, float] = self._load_profit_guard_px_state()
+        self._lp_last_px: Dict[str, float] = self._load_loss_guard_px_state()
+        # === 特征快照缓存（由 q.features.snapshot 实时填充） ===
+        self._feat_cache: Dict[str, dict] = {}
+        # —— 重启后确认分档/去重状态是否恢复 —— #
+        logging.info("[LP][RESTORE] hits_keys=%d px_keys=%d",
+                     len(self._lp_hits), len(self._lp_last_px))
+        logging.debug("[LP][RESTORE][SAMPLE] %s",
+                      dict(list(self._lp_hits.items())[:5]))
+        # === 新增：WS/MQ 最新价缓存（instId -> {last,bid,ask,ts}） ===
+        # ts 统一用 epoch 秒（float）
+        self._px_cache: Dict[str, Dict[str, float]] = {}
+        # 最新价“新鲜度”阈值（秒），可在 config.yaml 配置 ws_px_ttl_sec
+        self.WS_PX_TTL = float(cfg.get("ws_px_ttl_sec", 0.5))
+        # 最近一次成功获取到的 positions（网络抖动时的兜底）
+        self._last_good_positions: list[Dict[str, Any]] = []
+        # 记录主钱包最近一次观测到的 szi（币数量），用于 INC/DEC 按比例跟随
+        self._last_szi: Dict[str, float] = {}
+        # 清理被过滤币种的历史缓存，避免继续参与权重/跟随
+        for k in list(self._wallet_value.keys()):
+            if str(k).upper() in self.FILTER_TOKENS:
+                self._wallet_value.pop(k, None)
+        for k in list(self._last_szi.keys()):
+            if str(k).upper() in self.FILTER_TOKENS:
+                self._last_szi.pop(k, None)
+        # —— 冷启动保护：给 MQ 首批“全量 OPEN”一个缓冲时间，避免重复加单 —— #
+        self._start_ts  = time.time()
+        # 可在 config.yaml 根级加 warmup_sec: 5（默认 5s）
+        self.WARMUP_SEC = float(cfg.get("warmup_sec", 15))
+
+        # ─── 波动/ATR 配置（改为走 MQ 提供的 vol.atr_pct） ─── #
+        self._vol_cfg = cfg.get("volatility", {}) or {}
+        self._k_atr   = float(self._vol_cfg.get("trigger_px_k_atr", 0.0) or 0.0)
+        self._pp_k    = float(self._vol_cfg.get("pp_atr_k", 3.0) or 3.0)
+        self._pp_min  = float(self._vol_cfg.get("pp_step_min_roe", 45.0) or 45.0)
+        self._pp_max  = float(self._vol_cfg.get("pp_step_max_roe", 140.0) or 140.0)
+        self._vol_ttl = float(self._vol_cfg.get("cache_ttl_sec", 20.0) or 20.0)
+        # 来自 MQ 的波动缓存：instId -> {"ts":float,"atr_pct":float,"median_pct":float}
+        self._vol_cache: dict[str, dict] = {}
+        # —— ATR 动态亏损保护（LP）参数（未监控交易对时启用） —— #
+        self._lp_k   = float(self._vol_cfg.get("lp_atr_k", 2.0) or 2.0)
+        self._lp_min = float(self._vol_cfg.get("lp_step_min_roe", 15.0) or 15.0)
+        self._lp_max = float(self._vol_cfg.get("lp_step_max_roe", 80.0) or 80.0)
+        # === 新增：position tier（imr）TTL 缓存 ===
+        # {instId: {"imr": float, "ts": epoch_sec}}
+        self._tier_cache: Dict[str, Dict[str, float]] = {}
+        # 可在 config.yaml 根级覆盖：tier_ttl_sec，默认 300s
+        self.TIER_TTL = float(cfg.get("tier_ttl_sec", 300))
+        # === 新增：已应用杠杆缓存（只在变更时才 set_leverage） ===
+        # key=(instId, posSide or ""), value=int(applied_leverage)
+        self._applied_lev: Dict[Tuple[str, str], int] = {}
+        # 优化 4：组合维度“波动率配比”预算分配（risk-parity 近似）
+        self.BUDGET_TARGET_ATR = float(self._vol_cfg.get("budget_target_atr_pct", 3.0))
+        self.BUDGET_VOL_MIN    = float(self._vol_cfg.get("budget_vol_scale_min", 0.5))
+        self.BUDGET_VOL_MAX    = float(self._vol_cfg.get("budget_vol_scale_max", 2.0))
+        # ─── 急跌/急涨入场价保护（Crash-Adaptive Entry Protect） ─── #
+        _ep = (cfg.get("entry_protect") or {})  # 缺省启用，默认参数见下
+        self.EP_ENABLE            = bool(_ep.get("enable", True))
+        self.EP_WINDOW_SEC        = int(_ep.get("window_sec", 480))          # 回看窗口：8 分钟
+        self.EP_BAR               = str(_ep.get("bar", "1m"))                # K 线粒度
+        self.EP_TRIGGER_K_ATR     = float(_ep.get("trigger_drop_k_atr", 2.5))# 触发阈值 = K×ATR%
+        self.EP_SATURATE_K_ATR    = float(_ep.get("saturate_drop_k_atr", 5.0))# 饱和值 = K×ATR%
+        self.EP_MAX_EXTRA_PCT     = float(_ep.get("max_extra_shift_pct", 1.6))# 基线最多再偏移 %
+        self.EP_ANCHOR_BAND_K_ATR = float(_ep.get("anchor_band_k_atr", 0.2)) # 极值外保护带 = K×ATR%
+        self.EP_BLEND_GAMMA       = float(_ep.get("blend_gamma", 1.4))       # 严重度凸性
+        # 优化 2：PP/LP 递进 cut 序列（百分比小数，回退到单一比例）
+        _pp_seq = list(map(float, risk_cfg.get("pp_cuts", [])))
+        _lp_seq = list(map(float, risk_cfg.get("lp_cuts", [])))
+        self.PP_CUTS = (_pp_seq if _pp_seq else ([self.PP_CUT_RATIO] if self.PP_CUT_RATIO>0 else []))[:10]
+        self.LP_CUTS = (_lp_seq if _lp_seq else ([self.LP_CUT_RATIO] if self.LP_CUT_RATIO>0 else []))[:10]
+
+        # 优化 6：触发冷却 + 双阈值滞回
+        _hy = (cfg.get("hysteresis") or risk_cfg or {})
+        self.TRIGGER_COOLDOWN_SEC = float(_hy.get("trigger_cooldown_sec", 5.0))
+        self.HYS_BAND_PCT         = float(_hy.get("hysteresis_band_pct", 10.0))  # 低阈 = 高阈*(1-此比例)
+        self._cooldown_ts: dict[str, float] = {}
+        self._hys_state_pp: dict[str, str] = {}  # "armed"/"disarmed"
+        self._hys_state_lp: dict[str, str] = {}
+
+        # 优化 1：ROE 高水位拖尾止盈（MFE）
+        self.MFE_START_PCT   = float(risk_cfg.get("mfe_trail_start_pct", 60.0))
+        self.MFE_BACKOFF_PCT = float(risk_cfg.get("mfe_trail_backoff_pct", 20.0))
+        self.MFE_CUTS        = list(map(float, risk_cfg.get("mfe_trail_cuts", [0.25, 0.35, 0.40])))[:10]
+        self._mfe_peak: dict[str, float] = {}
+        self._mfe_hits: dict[str, int] = {}
+        # MFE A+B：A) ROE 去重；B) 新峰值再武装
+        self.MFE_ROE_TOL_PCT      = float(risk_cfg.get("mfe_roe_tol_pct", 3.0))     # A：同位置容差（百分比点）
+        self.MFE_REARM_DELTA_PCT  = float(risk_cfg.get("mfe_rearm_delta_pct", 2.0))  # B：再武装需要的新峰值增量
+        self._mfe_last_roe: dict[str, float] = {}
+        self._mfe_gated: dict[str, bool] = {}               # 触发后置 True，直到出现“新峰值≥last_peak+ε”
+        self._mfe_last_peak_trig: dict[str, float] = {}     # 上一次触发时的峰值（用于 B 方案再武装）
+        # ─── 引入 Volume Profile 风控助手 ─── #
+        self._rg = RiskGuardian()
+        # 缓存由 RG 计算出的入场修正与 SL/节点（按 instId+posSide 维度）
+        # 结构：{"entry_adj":..., "sl":[...], "tp_nodes":[...], "sl_nodes":[...], "guards":{"profit_protect_ref":..., "loss_protect_ref":...}}
+        self._vp_levels: dict[str, dict] = {}
+        # ===== 新增：多时段节点（HVN/LVN）触发计数 =====
+        self._node_tp_hits: dict[str, int] = {}   # HVN 盈利保护触发层级
+        self._node_sl_hits: dict[str, int] = {}   # LVN 亏损保护触发层级
+        # VP 分级减仓比例（可在 config.yaml.risk.vp_tp_cuts / vp_sl_cuts 覆盖）
+        vp_cfg = (cfg.get("risk", {}) or {})
+        self.VP_TP_CUTS = list(map(float, vp_cfg.get("vp_tp_cuts", [0.25, 0.35, 0.40])))[:3]
+        self.VP_SL_CUTS = list(map(float, vp_cfg.get("vp_sl_cuts", [0.33, 0.50, 1.00])))[:3]
+        # 新增：节点触发的分级减仓比例（默认沿用 VP_* 配置，可在 config.yaml.risk.* 覆盖）
+        self.NODE_TP_CUTS = list(map(float, vp_cfg.get("node_tp_cuts", self.VP_TP_CUTS)))[:3]
+        self.NODE_SL_CUTS = list(map(float, vp_cfg.get("node_sl_cuts", self.VP_SL_CUTS)))[:3]
+        # 优化 8：节点触发“保守确认”带宽（阈值需越过 HVN/LVN 一定带宽才视为命中）
+        self.NODE_CONFIRM_K_ATR  = float(vp_cfg.get("node_confirm_k_atr", 0.5))  # × ATR%
+        self.NODE_CONFIRM_MIN_PCT = float(vp_cfg.get("node_confirm_min_pct", 0.2))  # 最小额外百分比
+        # 若 HVN/LVN 节点为空，是否回退到 ATR 分档保护（默认 True，可在 risk.use_atr_fallback_when_no_nodes 配置）
+        self.USE_ATR_FALLBACK = bool(vp_cfg.get("use_atr_fallback_when_no_nodes", True))
+
+        # === 监控状态缓存：instId/coin -> True/False；默认 False（未标注即视为未监控→走 ATR）===
+        self._monitored_inst: dict[str, bool] = {}
+        self._monitored_coin: dict[str, bool] = {}
+        self._monitor_last: dict[str, dict] = {}  # 诊断信息
+        # —— 负缓存：查不到 SWAP 的币，TTL 期内不再查询 —— #
+        # miss: coin -> 首次失败时间戳；miss_log_ts：限流日志时间戳
+        self._pair_miss: Dict[str, float] = {}
+        self._miss_log_ts: Dict[str, float] = {}
+        # 可在 config.yaml 根级加 miss_ttl: 1800（默认 30 分钟）
+        self.MISS_TTL = float(cfg.get("miss_ttl", 1800))
+
+        # === 启动特征队列消费者（直投模式，默认队列 q.features.snapshot） ===
+        self._start_feature_feed()
+        self._io_locks = defaultdict(threading.Lock)
+    # 规范化 filter_tokens（list / set / tuple / comma string / dict{TOKEN:bool}）
+    def _normalize_token_filter(self, raw) -> set[str]:
+        toks: set[str] = set()
+        try:
+            if isinstance(raw, str):
+                parts = re.split(r"[,\s]+", raw)
+                toks = {p.strip().upper() for p in parts if p.strip()}
+            elif isinstance(raw, (list, tuple, set)):
+                toks = {str(p).strip().upper() for p in raw if str(p).strip()}
+            elif isinstance(raw, dict):
+                toks = {str(k).strip().upper() for k, v in raw.items() if v and str(k).strip()}
+        except Exception:
+            pass
+        return toks
+    # ============================================================
+    #  收益保护：加载 / 保存 / key 生成
+    # ============================================================
+    def _load_profit_guard_state(self) -> Dict[str, int]:
+        if not self._pp_state_path.exists():
+            return {}
+        try:
+            with open(self._pp_state_path, "r", encoding="utf-8") as fp:
+                raw = json.load(fp)
+                # 统一成 {str:int}
+                return {str(k): int(v) for k, v in raw.items()}
+        except Exception:
+            return {}
+
+    def _save_profit_guard_state(self) -> None:
+        try:
+            self._atomic_json_dump(self._pp_state_path, self._pp_hits)
+        except Exception as e:
+            logging.warning("写入 profit_guard_state 失败: %s", e)
+
+    @staticmethod
+    def _pp_key(inst_id: str, pos_side: str) -> str:
+        # pos_side: "long" / "short"
+        return f"{inst_id}:{pos_side}"
+    # ============================================================
+    #  止损保护：加载 / 保存
+    # ============================================================
+    def _load_loss_guard_state(self) -> Dict[str, int]:
+        if not getattr(self, "_lp_state_path", None) or not self._lp_state_path.exists():
+            return {}
+        try:
+            with open(self._lp_state_path, "r", encoding="utf-8") as fp:
+                raw = json.load(fp)
+                return {str(k): int(v) for k, v in raw.items()}
+        except Exception:
+            return {}
+
+    def _save_loss_guard_state(self) -> None:
+        try:
+            self._atomic_json_dump(self._lp_state_path, self._lp_hits)
+        except Exception as e:
+            logging.warning("写入 loss_guard_state 失败: %s", e)
+    # ===================== 价格去重状态（加载/保存） =====================
+    def _load_profit_guard_px_state(self) -> Dict[str, float]:
+        try:
+            if not self._pp_px_path.exists():
+                return {}
+            with open(self._pp_px_path, "r", encoding="utf-8") as fp:
+                return {str(k): float(v) for k, v in json.load(fp).items()}
+        except Exception:
+            return {}
+
+    def _save_profit_guard_px_state(self) -> None:
+        try:
+            self._atomic_json_dump(self._pp_px_path, self._pp_last_px)
+        except Exception as e:
+            logging.warning("写入 profit_guard_px 失败: %s", e)
+
+    def _load_loss_guard_px_state(self) -> Dict[str, float]:
+        try:
+            if not self._lp_px_path.exists():
+                return {}
+            with open(self._lp_px_path, "r", encoding="utf-8") as fp:
+                return {str(k): float(v) for k, v in json.load(fp).items()}
+        except Exception:
+            return {}
+
+    def _save_loss_guard_px_state(self) -> None:
+        try:
+            self._atomic_json_dump(self._lp_px_path, self._lp_last_px)
+        except Exception as e:
+            logging.warning("写入 loss_guard_px 失败: %s", e)
+    # ============================================================
+    #  工具：判断是否为被过滤的币种
+    # ============================================================
+    def _is_filtered_coin(self, coin: str) -> bool:
+        return coin.upper() in getattr(self, "FILTER_TOKENS", set())
+    # ============================================================
+    #  负缓存：避免对不存在合约的币频繁打 API
+    # ============================================================
+    def _skip_miss_coin(self, coin: str) -> bool:
+        ts = self._pair_miss.get(coin.upper())
+        return (ts is not None) and (time.time() - ts < self.MISS_TTL)
+
+    def _note_miss_coin(self, coin: str) -> None:
+        coin = coin.upper()
+        self._pair_miss[coin] = time.time()
+        # 日志限流：每 5 分钟打一条提示
+        last = self._miss_log_ts.get(coin, 0.0)
+        if time.time() - last > 300:
+            logging.info("未找到 %s 对应的 SWAP 交易对（将在 %ds 内不再查询）",
+                         coin, int(self.MISS_TTL))
+            self._miss_log_ts[coin] = time.time()
+    def _in_warmup(self) -> bool: return (time.time() - self._start_ts) < self.WARMUP_SEC
+    # ============================================================
+    #  波动/ATR：辅助（可选，适配器不存在时返回 None）
+    # ============================================================
+    def _get_atr_state(self, inst_id: str) -> dict | None:
+        """
+       由 MQ 的 vol 字段提供 ATR%，这里只做 TTL 缓存读取。
+        """
+        now = time.time()
+        st  = self._vol_cache.get(inst_id)
+        if st and (now - st.get("ts", 0.0) < self._vol_ttl):
+            return st
+        return None
+
+    def _px_tol_pct(self, inst_id: str) -> float:
+        """
+        价格去重容差（百分比）：max(配置固定值, k_atr * ATR%)；无 ATR 时回退到 base
+        """
+        base = float(self.TRIGGER_PX_TOL_PCT or 0.0)
+        if self._k_atr <= 0:
+            return base
+        st = self._get_atr_state(inst_id)
+        if not st:
+            return base
+        atr_pct = float(st.get("atr_pct") or 0.0)
+        return max(base, self._k_atr * atr_pct)
+    # ====================== 价格缓存（WS/MQ）辅助 ====================== #
+    def _update_px_cache(self, inst_id: str, last: float | None = None,
+                         bid: float | None = None, ask: float | None = None,
+                         ts: float | None = None) -> None:
+        """把来自 MQ/WS 的价推入缓存。任何一个字段存在即可更新。"""
+        if not inst_id:
+            return
+        rec = self._px_cache.get(inst_id, {})
+        if last is not None:
+            with suppress(Exception): rec["last"] = float(last)
+        if bid is not None:
+            with suppress(Exception): rec["bid"]  = float(bid)
+        if ask is not None:
+            with suppress(Exception): rec["ask"]  = float(ask)
+        # ts 优先用传入值，否则用当前时间
+        tnow = time.time()
+        if ts is None:
+            ts = tnow
+        else:
+            # 支持 ms 时间戳
+            with suppress(Exception):
+                ts = float(ts)
+                if ts > 1e12:  # ms → s
+                    ts = ts / 1000.0
+        rec["ts"] = float(ts) if ts else tnow
+        self._px_cache[inst_id] = rec
+
+    def _maybe_update_px_cache_from_evt(self, evt: dict, inst_id: str | None = None) -> None:
+        """从事件里提取 mid/last/bbo 更新缓存（若带有 price & ts）。"""
+        try:
+            inst = (inst_id or evt.get("instId") or "").upper()
+            if not inst:
+                return
+            ts = evt.get("ts") or evt.get("timestamp") or evt.get("T") or evt.get("t")
+            # 兼容字段：midPx / last / px
+            last = evt.get("midPx") or evt.get("last") or evt.get("px")
+            bid = evt.get("bid") or (evt.get("bbo") or {}).get("bid")
+            ask = evt.get("ask") or (evt.get("bbo") or {}).get("ask")
+            if last is None and (bid is None or ask is None):
+                return
+            self._update_px_cache(inst, last=last, bid=bid, ask=ask, ts=ts)
+        except Exception:
+            pass
+    # —— 新增：统一从事件里取“新鲜价”（优先 midPx/last，其次 bbo 中价）—— #
+    def _fresh_evt_px(self, e: dict) -> float | None:
+        """若事件时间戳足够新（≤ WS_PX_TTL），提取一个可用价。"""
+        try:
+            ts = e.get("ts") or e.get("timestamp") or e.get("T") or e.get("t")
+            if ts is None:
+                return None
+            ts = float(ts);  ts = ts / 1000.0 if ts > 1e12 else ts
+            if (time.time() - ts) > max(0.0, float(self.WS_PX_TTL)):
+                return None
+            v  = e.get("midPx") or e.get("last") or e.get("px")
+            b  = e.get("bid") or (e.get("bbo") or {}).get("bid")
+            a  = e.get("ask") or (e.get("bbo") or {}).get("ask")
+            if v is not None:
+                v = float(v)
+                return v if v > 0 else None
+            if b is not None and a is not None:
+                return (float(b) + float(a)) / 2.0
+        except Exception:
+            return None
+        return None
+
+    # ====================== 入场价保护：辅助 K 线与定价 ====================== #
+    def _bar_seconds(self, bar: str) -> int:
+        """把 '1m' / '5m' / '1h' / '1d' 转为秒；无效值按 1m 处理。"""
+        bar = (bar or "1m").lower().strip()
+        if bar.endswith("m"):
+            with suppress(Exception):
+                return max(60, int(bar[:-1]) * 60)
+            return 60
+        if bar.endswith("h"):
+            with suppress(Exception):
+                return max(3600, int(bar[:-1]) * 3600)
+            return 3600
+        if bar in ("1d", "1D"):
+            return 86400
+        return 60
+
+    def _recent_high_low(self, inst_id: str, window_sec: int, bar: str) -> tuple[float | None, float | None]:
+        """
+        读取最近窗口内的最高/最低价。OKX SDK 不同版本 K 线方法名可能不同，做双兼容。
+        """
+        meth = getattr(self.market_api, "get_candlesticks", None) or getattr(self.market_api, "get_history_candlesticks", None)
+        if not meth:
+            return None, None
+        try:
+            n = max(2, min(120, int(math.ceil(window_sec / max(1, self._bar_seconds(bar)))) + 2))
+            resp = self._call_api(meth, instId=inst_id, bar=bar, limit=n)
+            rows = (resp or {}).get("data") or []
+            hi, lo = None, None
+            for r in rows:
+                try:
+                    _h = float(r[2]); _l = float(r[3])        # 兼容数组形式 [ts,o,h,l,c,...]
+                except Exception:
+                    _h = float((r.get("h") or r.get("high") or 0) or 0)
+                    _l = float((r.get("l") or r.get("low")  or 0) or 0)
+                if _h > 0: hi = _h if hi is None else max(hi, _h)
+                if _l > 0: lo = _l if lo is None else min(lo, _l)
+            return hi, lo
+        except Exception:
+            return None, None
+
+    def _protected_entry_price(self, inst_id: str, side_flag: str,
+                               baseline_px: float, last_px: float, slip: float) -> float:
+        """
+        急跌/急涨场景：基于最近窗口极值与 ATR%，把入场价从 baseline 再向极值侧“推一截”，
+        并按严重度增加偏移，但不超过 max_extra_shift_pct 的上限。
+        side_flag: "LONG" / "SHORT"
+        """
+        try:
+            if (not self.EP_ENABLE) or baseline_px <= 0 or last_px <= 0:
+                return float(baseline_px)
+            # 钳制关键参数，避免配置异常
+            mx = max(0.0, float(self.EP_MAX_EXTRA_PCT or 0.0))
+            gamma = max(1.0, float(self.EP_BLEND_GAMMA or 1.0))
+            st = self._get_atr_state(inst_id)
+            atr_pct = float((st or {}).get("atr_pct") or 0.0)
+            hi, lo = self._recent_high_low(inst_id, self.EP_WINDOW_SEC, self.EP_BAR)
+            if not hi or not lo:
+                return float(baseline_px)
+
+            if side_flag == "LONG":
+                drop_pct = max(0.0, (hi - last_px) / hi * 100.0)   # 距最高点回撤百分比
+            else:  # SHORT
+                drop_pct = max(0.0, (last_px - lo) / lo * 100.0)   # 距最低点反弹百分比
+
+            trigger  = (self.EP_TRIGGER_K_ATR  * atr_pct) if atr_pct > 0 else 3.0
+            saturate = (self.EP_SATURATE_K_ATR * atr_pct) if atr_pct > 0 else 6.0
+            if drop_pct <= trigger:
+                return float(baseline_px)
+            if saturate <= trigger: 
+                saturate = trigger + 1e-6
+            sev = min(1.0, max(0.0, (drop_pct - trigger) / (saturate - trigger)))
+            w   = sev ** gamma
+            band = (self.EP_ANCHOR_BAND_K_ATR * atr_pct) / 100.0 if atr_pct > 0 else 0.0
+
+            if side_flag == "LONG":
+                anchor = float(lo) * (1.0 - max(0.0, band))
+                anchor_slipped = anchor * (1.0 - abs(float(slip or 0.0)))
+                extra = mx * w / 100.0
+                floor_long = float(baseline_px) * (1.0 - extra)
+                candidate  = max(anchor_slipped, floor_long)
+                return float(min(baseline_px, candidate))
+            else:
+                anchor = float(hi) * (1.0 + max(0.0, band))
+                anchor_slipped = anchor * (1.0 + abs(float(slip or 0.0)))
+                extra = mx * w / 100.0
+                ceil_short = float(baseline_px) * (1.0 + extra)
+                candidate  = min(anchor_slipped, ceil_short)
+                return float(max(baseline_px, candidate))
+        except Exception:
+            return float(baseline_px)
+    # 优化 9：按分档 level 放大/缩小“价格去重”容差
+    def _lvl_factor(self, lvl: int) -> float:
+        try:
+            if self.PX_LVL_FACTORS:
+                i = max(0, min(int(lvl)-1, len(self.PX_LVL_FACTORS)-1))
+                f = float(self.PX_LVL_FACTORS[i])
+                return f if isfinite(f) and f>0 else 1.0
+        except Exception:
+            pass
+        return 1.0 + max(0.0, float(self.PX_LVL_K)) * max(0, int(lvl)-1)
+
+    # 优化 6：通用冷却
+    def _under_cooldown(self, key: str, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        last = float(self._cooldown_ts.get(key, 0.0) or 0.0)
+        return (now - last) < max(0.0, float(self.TRIGGER_COOLDOWN_SEC))
+    def _mark_cooldown(self, key: str) -> None:
+        self._cooldown_ts[key] = time.time()
+
+    # 优化 4：波动率配比（risk-parity 近似）预算缩放
+    def _budget_scale_by_vol(self, inst_id: str) -> float:
+        st = self._get_atr_state(inst_id)
+        if not st:
+            return 1.0
+        atr = float(st.get("atr_pct") or 0.0)
+        if atr <= 0:
+            return 1.0
+        scale = max(self.BUDGET_VOL_MIN, min(self.BUDGET_VOL_MAX, self.BUDGET_TARGET_ATR / atr))
+        return scale
+
+    def _pp_step_threshold(self, lev: float, need_lvl: int, inst_id: str) -> float | None:
+        """
+        动态阶梯（返回 ROE%）= clamp(lev × ATR% × k, pp_min, pp_max) × need_lvl
+        无 ATR 时返回 None（上层回退静态参数）。
+        """
+        st = self._get_atr_state(inst_id)
+        if not st:
+            return None
+        atr_pct = float(st.get("atr_pct") or 0.0)
+        if atr_pct <= 0:
+            return None
+        step = max(self._pp_min, min(self._pp_max, float(lev) * atr_pct * self._pp_k))
+        return step * max(1, int(need_lvl))
+
+    def _is_monitored(self, inst_id: str | None = None, coin: str | None = None) -> bool:
+        """
+        返回该交易对是否处于生产端实时监控中。
+        规则：
+          - 若该币在 miss TTL（API 证实本交易所没有此 SWAP），直接判定未监控；
+          - 其次看本地监控标记；
+          - 默认 False（未监控）。
+        """
+        if coin and self._skip_miss_coin(coin):
+            return False
+        if inst_id is not None and inst_id in self._monitored_inst:
+            return bool(self._monitored_inst[inst_id])
+        if coin:
+            c = coin.upper()
+            if c in self._monitored_coin:
+                return bool(self._monitored_coin[c])
+        return False
+    # ============================================================
+    #  多时段节点筛选：保证“≥min_gap_pct 的 ROE 距离”（含当前杠杆）
+    #  direction: "tp" (盈利方向) | "sl" (亏损方向)
+    #  pos_side : "long" | "short"
+    # ============================================================
+    def _select_nodes_with_min_roe_gap(
+        self,
+        nodes: list[float],
+        entry_px: float,
+        pos_side: str,
+        direction: str,
+        lev: float,
+        min_gap_pct: float
+    ) -> list[float]:
+        try:
+            lev = float(lev or 1.0)
+            entry_px = float(entry_px or 0.0)
+            mg = float(min_gap_pct or 0.0)
+        except Exception:
+            return []
+        if not nodes or entry_px <= 0 or lev <= 0:
+            return []
+        # 安全转换：忽略无法转成 float 的元素，避免 ValueError
+        vals: list[float] = []
+        for x in (nodes or []):
+            try:
+                vals.append(float(x))
+            except (TypeError, ValueError):
+                continue
+        selected: list[float] = []
+        # 方向与排序（从入场价往“预期方向”一步步筛）
+        if direction == "tp":  # 盈利方向
+            if pos_side == "long":
+                cands = sorted([v for v in vals if v > entry_px])
+                last = entry_px
+                for v in cands:
+                    roe = ((v - last) / last) * 100.0 * lev
+                    if roe >= mg:
+                        selected.append(v)
+                        last = v
+            else:  # short 盈利向下
+                cands = sorted([v for v in vals if v < entry_px], reverse=True)
+                last = entry_px
+                for v in cands:
+                    roe = ((last - v) / last) * 100.0 * lev
+                    if roe >= mg:
+                        selected.append(v)
+                        last = v
+        else:  # "sl" 亏损方向
+            if pos_side == "long":  # 亏损向下
+                cands = sorted([v for v in vals if v < entry_px], reverse=True)
+                last = entry_px
+                for v in cands:
+                    roe = ((last - v) / last) * 100.0 * lev
+                    if roe >= mg:
+                        selected.append(v)
+                        last = v
+            else:  # short 亏损向上
+                cands = sorted([v for v in vals if v > entry_px])
+                last = entry_px
+                for v in cands:
+                    roe = ((v - last) / last) * 100.0 * lev
+                    if roe >= mg:
+                        selected.append(v)
+                        last = v
+        return selected
+    def _clear_vp_state(self, inst_id: str) -> None:
+        """关闭 VP/HVN/LVN 时，清理相关状态，避免误触发。"""
+        for side in ("long", "short"):
+            key = f"{inst_id}:{side}"
+            self._vp_levels.pop(key, None)
+            self._node_tp_hits.pop(key, None)
+            self._node_sl_hits.pop(key, None)
+
+    def _lp_step_threshold(self, lev: float, need_lvl: int, inst_id: str) -> float | None:
+        """
+        ATR 动态亏损分档阈值（单位：ROE%）= clamp(lev × ATR% × lp_k, lp_min, lp_max) × need_lvl
+        无 ATR 时返回 None。
+        """
+        st = self._get_atr_state(inst_id)
+        if not st:
+            return None
+        atr_pct = float(st.get("atr_pct") or 0.0)
+        if atr_pct <= 0:
+            return None
+        step = max(self._lp_min, min(self._lp_max, float(lev) * atr_pct * self._lp_k))
+        return step * max(1, int(need_lvl))
+
+    # ============================================================
+    #  杠杆选择助手
+    # ============================================================
+    def _select_leverage(self, max_lev: int, mq_lev: int | None = None) -> int:
+        """
+        选定杠杆（不超过 max_lev）：
+          • max    → max_lev
+          • normal → mq_lev 或本地 self.leverage
+          • double → mq_lev 存在则 2×mq_lev；否则回退到本地 self.leverage（不盲目翻倍）
+        """
+        if self.leverage_mode == "max":
+            return max_lev
+        if self.leverage_mode == "double":
+            # mq_lev 缺失时，本地基准同样翻倍
+            base = (mq_lev * 2) if mq_lev else int(float(self.leverage)) * 2
+        else:
+            base = mq_lev if mq_lev else int(float(self.leverage))
+        chosen = max(1, min(max_lev, int(base)))
+        if mq_lev is None:
+            logging.debug("[LEV] MQ 未提供 leverage → 使用本地基准 %sx（mode=%s，cap=%s）",
+                          base, self.leverage_mode, max_lev)
+        return chosen
+    # ============================================================
+    #  暖身期 / 风控早退等场景：不开单也确保杠杆到位
+    # ============================================================
+    def _ensure_leverage(self, inst_id: str, pos_side: str, mq_lev: int | None) -> None:
+        """
+        仅当“希望杠杆”与已应用值不同，才调用 set_leverage；成功后写入 _applied_lev。
+        """
+        try:
+            max_lev, _, _, _ = self._get_inst_spec(inst_id)
+            chosen = int(self._select_leverage(max_lev, mq_lev))
+            key = (inst_id, pos_side or "")
+            if self._applied_lev.get(key) == chosen:
+                return
+            res = self._apply_and_verify_leverage(inst_id, pos_side, chosen)
+            if res.get("ok"):
+                applied = int(res.get("applied") or chosen)
+                self._applied_lev[key] = applied
+            else:
+                logging.warning("[LEV][ENSURE] set_leverage failed(see above): inst=%s pos=%s req=%sx", inst_id, pos_side, chosen)
+        except Exception as e:
+            logging.warning("[LEV][ENSURE] set_leverage failed: %s", e)
+
+    # ============================================================
+    #  新增：统一设置杠杆并回读校验，明确记录失败原因 / 截断信息
+    # ============================================================
+    def _apply_and_verify_leverage(self, inst_id: str, pos_side: str | None, req_lev: int) -> dict:
+        """
+        封装 set_leverage：
+          1) 调用 set_leverage 并把返回的 code/msg/data 打印出来；
+          2) 通过 get_leverage / get_leverage_info 回读实际生效的 lever 与 maxLever；
+          3) 若实际 lever != 请求值，打印“被上限截断到 X 倍”的警告。
+
+        返回：{"ok": bool, "resp": dict|None, "applied": int|None, "max": int|None}
+        """
+        lev_kwargs = dict(instId=inst_id, lever=str(int(req_lev)), mgnMode=self.margin_mode)
+        if self.margin_mode == "isolated" and self.pos_mode == "long_short" and pos_side:
+            lev_kwargs["posSide"] = pos_side  # long / short
+        # 1) 设置
+        try:
+            resp = self._call_api(self.account_api.set_leverage, **lev_kwargs)
+            code = str((resp or {}).get("code", ""))
+            msg  = (resp or {}).get("msg", "")
+            if code and code != "0":
+                logging.warning("[LEV][SET][FAIL] inst=%s pos=%s req=%sx → code=%s msg=%s data=%s",
+                               inst_id, pos_side or "-", req_lev, code, msg, (resp or {}).get("data"))
+                return {"ok": False, "resp": resp, "applied": None, "max": None}
+        except Exception as e:
+            status = getattr(e, "response", None)
+            sc = getattr(status, "status_code", None)
+            logging.warning("[LEV][SET][EXC] inst=%s pos=%s req=%sx → %s%s",
+                            inst_id, pos_side or "-", req_lev, type(e).__name__,
+                            f" http={sc}" if sc else "")
+            return {"ok": False, "resp": None, "applied": None, "max": None}
+
+        # 2) 回读校验（不同 SDK 版本有 get_leverage 或 get_leverage_info）
+        applied, max_seen = None, None
+        for _meth in ("get_leverage", "get_leverage_info"):
+            meth = getattr(self.account_api, _meth, None)
+            if not meth:
+                continue
+            try:
+                info = self._call_api(meth, instId=inst_id, mgnMode=self.margin_mode)
+                rows = (info or {}).get("data", []) or []
+                for r in rows:
+                    if r.get("instId", inst_id) != inst_id:
+                        continue
+                    if self.margin_mode == "isolated" and self.pos_mode == "long_short":
+                        ps = (r.get("posSide") or "").lower()
+                        if pos_side and ps and ps != pos_side.lower():
+                            continue
+                    try:
+                        applied = int(float(r.get("lever") or r.get("mgnLeverage") or 0))
+                    except Exception:
+                        applied = None
+                    try:
+                        max_seen = int(float(r.get("maxLever") or r.get("lever") or 0)) or max_seen
+                    except Exception:
+                        pass
+                    break  # 读取到匹配行就跳出内层
+                if applied is not None or max_seen is not None:
+                    break     # 已读到有效值，跳出方法选择循环
+            except Exception as e:
+                logging.debug("[LEV][VERIFY] %s failed: %s", _meth, e)
+        if applied is not None and applied != int(req_lev):
+            logging.warning("[LEV][VERIFY] %s/%s 请求 %sx，实际生效 %sx（可能被上限或风控截断；max≈%s）",
+                            inst_id, pos_side or "-", int(req_lev), applied, max_seen)
+        return {"ok": True, "resp": resp, "applied": applied, "max": max_seen}     
+
+
+    # ============================================================
+    #  杠杆缓存：加载 / 保存
+    # ============================================================
+    def _load_leverage_cache(self) -> Dict[str, int]:
+        """lev_cache.json → {instId: maxLever}，读取失败返回空 dict"""
+        if not self._lev_cache_path.exists():
+            return {}
+        try:
+            with open(self._lev_cache_path, "r", encoding="utf-8") as fp:
+                return {k: int(v) for k, v in json.load(fp).items()}
+        except Exception:
+            return {}
+
+    def _save_leverage_cache(self) -> None:
+        try:
+            self._atomic_json_dump(self._lev_cache_path, self._lev_cache)
+        except Exception as e:
+            logging.warning("写入 lev_cache 失败: %s", e)
+
+    # ============================================================
+    #  1) 通用 API 调用包装 —— 自动重连
+    # ============================================================
+    def _call_api(self, func: Callable, *args, **kwargs):
+        """
+        对 OKX SDK 的 HTTP 调用做 5 次以内的指数退避重试。
+        捕获所有 Exception；最后一次仍失败时抛出让上层处理。
+        """
+        delay = 0.5               # 初始等待 0.5 s
+        for attempt in range(1, 6):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                # 特定网络/协议错误时，重建客户端再继续重试
+                emsg = f"{type(e).__name__}: {e}"
+                if ("ConnectionTerminated" in emsg) or ("Server disconnected" in emsg) or ("RemoteProtocolError" in emsg):
+                    self._rebuild_clients()
+                if attempt == 5:
+                    raise
+                jitter = random.random() * 0.3     # 30% 抖动，防止雪崩
+                logging.warning(
+                    "[RETRY %s/5] %s failed: %s — next in %.2fs",
+                    attempt, getattr(func, "__name__", repr(func)), e, delay
+                )
+                time.sleep(delay)
+                delay *= 1.8 + jitter              # 指数退避
+
+    # ---------- 杠杆缓存：加载 & 保存 ----------
+    def _load_spec_cache(self) -> Dict[str, Dict[str,str]]:
+        """加载本地缓存：{instId: {"maxLever": "...", "lotSz": "...", "minSz": "..."}}"""
+        if not self._spec_cache_path.exists():
+            return {}
+        try:
+            with open(self._spec_cache_path, "r", encoding="utf-8") as fp:
+                return json.load(fp)
+        except Exception as e:
+            logging.warning("读取 inst_spec_cache 失败: %s", e)
+            return {}
+
+    def _save_spec_cache(self) -> None:
+        try:
+            # --- 简易文件锁，保证并发安全 --- #
+            with self._spec_lock.open("w") as lockfp:   # 锁文件
+                lockfp.write("1")
+            try:
+                # 原子写入以减少文件损坏概率
+                tmp = self._spec_cache_path.with_suffix(self._spec_cache_path.suffix + ".tmp")
+                with open(tmp, "w", encoding="utf-8") as fp:
+                    json.dump(self._spec_cache, fp, ensure_ascii=False, indent=2)
+                tmp.replace(self._spec_cache_path)
+            finally:
+                self._spec_lock.unlink(missing_ok=True)  # 解锁
+        except Exception as e:
+            logging.warning("写入 inst_spec_cache 失败: %s", e)
+    def _atomic_json_dump(self, path: pathlib.Path, data: Any) -> None:
+        path = pathlib.Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock = self._io_locks[str(path)]
+        with lock:
+            tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+            with open(tmp, "w", encoding="utf-8") as fp:
+                json.dump(data, fp, ensure_ascii=False)
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(tmp, path)  # POSIX 原子替换
+    def _get_inst_spec(self, inst_id:str) -> Tuple[int,float,str,float]:
+        """
+        返回 (maxLever, ctVal, ctValCcy, minSz)。maxLever 通过 _get_max_leverage() 获取并有缓存。
+        """
+        if inst_id in self._spec_cache:
+            d = self._spec_cache[inst_id]
+            need_keys = {"ctVal", "ctValCcy", "minSz"}
+            if need_keys.issubset(d):
+                max_lev = self._get_max_leverage(inst_id)
+                return (max_lev, float(d["ctVal"]), d["ctValCcy"], float(d["minSz"]))
+            self._spec_cache.pop(inst_id, None)  # 清除残缺缓存
+        try:
+            resp = self._call_api(
+                self.public_api.get_instruments,
+                instType="SWAP",
+                instId=inst_id
+            )
+            if resp["code"] == '0' and resp["data"]:
+                d = resp["data"][0]
+                ct_val      = max(float(d["ctVal"]), 1e-8)
+                ct_val_ccy  = d.get("ctValCcy", "USDT")
+                min_sz      = max(float(d["minSz"]), 1e-8)
+                self._spec_cache[inst_id] = {
+                    "ctVal"    : ct_val,
+                    "ctValCcy" : ct_val_ccy,
+                    "minSz"    : min_sz
+                }
+                self._save_spec_cache()
+                max_lev = self._get_max_leverage(inst_id)
+                return (max_lev, ct_val, ct_val_ccy, min_sz)
+        except Exception as e:
+            logging.warning("获取 %s 规格失败: %s", inst_id, e)
+        return int(float(self.leverage)), 1.0, "USDT", 1e-8
+    def _rebuild_clients(self) -> None:
+        # 2s 内只重建一次，且重建过程具备互斥，避免多线程互相踩踏
+        with self._rebuild_lock:
+            if time.time() - self._last_rebuild < 2.0:
+                return
+            self._last_rebuild = time.time()
+            try:
+                self.account_api = Account.AccountAPI(self._api_key, self._secret_key, self._passphrase, False, self.flag)
+                self.market_api  = MarketData.MarketAPI(flag=self.flag)
+                self.public_api  = PublicData.PublicAPI(flag=self.flag)
+                self.trade_api   = TradeAPI(self._api_key, self._secret_key, self._passphrase, False, self.flag)
+                logging.warning("[HTTP] Rebuilt OKX clients after connection error")
+            except Exception as e:
+                logging.exception("Rebuild clients failed: %s", e)
+    
+    # ============================================================
+    #  订阅 q.features.snapshot：缓存最新的 ATR%、多时段 VP、邻近 HVN/LVN
+    # ============================================================
+    def _start_feature_feed(self) -> None:
+        t = threading.Thread(target=self._feature_feed, name="feat-feed", daemon=True)
+        t.start()
+
+    def _feature_feed(self) -> None:
+        """
+        消费指标服务直投的快照（默认 q.features.snapshot）。
+        仅缓存必要字段：vol / profile_multi / profile_nodes / vpin 等。
+        """
+        try:
+            cred = pika.PlainCredentials(
+                os.getenv("RABBIT_USER", "monitor"),
+                os.getenv("RABBIT_PASSWORD", "P@ssw0rd"),
+            )
+            params = pika.ConnectionParameters(
+                host=os.getenv("RABBIT_HOST", "127.0.0.1"),
+                port=int(os.getenv("RABBIT_PORT", "5672")),
+                virtual_host=os.getenv("RABBIT_VHOST", "/"),
+                heartbeat=30,
+                blocked_connection_timeout=30,
+                credentials=cred,
+            )
+            conn = pika.BlockingConnection(params)
+            ch = conn.channel()
+            ch.basic_qos(prefetch_count=64)
+            qname = os.getenv("FEATURE_Q", "q.features.snapshot")
+
+            def _on_msg(ch_, method, props, body):
+                try:
+                    import json as _json
+                    payload = _json.loads(body.decode("utf-8"))
+                    # 兼容：有的消息外面包一层 feat，有的直接是快照
+                    snap = payload.get("feat") or payload
+                    # 更稳地解析 inst，并回填到 snap，方便后续日志和消费
+                    inst = (
+                        snap.get("instId") or payload.get("instId") or
+                        payload.get("inst_id") or payload.get("symbol") or
+                        payload.get("coin") or payload.get("base")
+                    )
+                    inst = inst.upper() if inst else ""
+                    if inst:
+                        snap.setdefault("instId", inst)
+                    if not inst:
+                        ch_.basic_ack(delivery_tag=method.delivery_tag); return
+                    # 新增：若特征快照里带有 mid/last/bbo，更新价格缓存
+                    try:
+                        last_px = snap.get("midPx") or snap.get("last") or snap.get("px")
+                        bid = snap.get("bid") or (snap.get("bbo") or {}).get("bid")
+                        ask = snap.get("ask") or (snap.get("bbo") or {}).get("ask")
+                        ts  = snap.get("ts")  # 约定为 ms；_update_px_cache 会自动识别 ms/s
+                        if last_px is not None or (bid is not None and ask is not None):
+                            self._update_px_cache(inst, last=last_px, bid=bid, ask=ask, ts=ts)
+                    except Exception:
+                        pass
+                    self._feat_cache[inst] = {
+                        "vol": snap.get("vol") or {},
+                        "profile_multi": snap.get("profile_multi") or {},
+                        "profile_nodes": snap.get("profile_nodes") or {},
+                        "features": snap.get("features") or {},
+                        "cvd": snap.get("cvd"),
+                        "vpin": snap.get("vpin"),
+                        "vpin_risk": snap.get("vpin_risk"),
+                        "ts": snap.get("ts"),
+                    }
+                    peek_features_snapshot(snap=snap, raw=False)
+                except Exception as e:
+                    logging.debug("[FEAT][DROP] %s", e)
+                finally:
+                    ch_.basic_ack(delivery_tag=method.delivery_tag)
+
+            ch.basic_consume(queue=qname, on_message_callback=_on_msg, auto_ack=False)
+            logging.info("[FEAT] consuming %s ...", qname)
+            ch.start_consuming()
+        except Exception as e:
+            logging.warning("[FEAT] feature feed exited: %s", e)
+
+    def _merge_feat_into_event(self, inst_id: str, evt: dict) -> None:
+        """
+        将缓存的最新特征并入当前事件（仅当事件缺失该字段时才写入）。
+        """
+        snap = self._feat_cache.get(inst_id) or {}
+        if not snap:
+            return
+        evt.setdefault("vol", snap.get("vol"))
+        # 让 quick_eval_from_event 能获取多时段 VP
+        evt.setdefault("profile_multi", snap.get("profile_multi"))
+        # 提供最近节点（可直接触发 HVN/LVN 保护）
+        if snap.get("profile_nodes"):
+            evt.setdefault("profile_nodes", snap["profile_nodes"])
+    # ---------- 新增：仅返回未成交委托 ----------
+    def get_pending_orders(self) -> list[Dict[str, Any]]:
+        """live / partially_filled 挂单，不含持仓、不含已成交"""
+        self._bootstrap_open_orders()             # 只刷新挂单即可
+        return [
+            od for od in self.orders.values()
+            if od.get("state") in {"live", "partially_filled"}
+        ]
+    # ---------- 新增：撤掉某 instId（可选方向）的全部挂单 ----------
+    def _cancel_all_pending(self, inst_id: str, pos_side: str | None = None) -> int:
+        """
+        取消指定 instId 的所有未成交挂单；
+        在 long_short 模式下，若传入 pos_side（'long'/'short'）则只取消该方向挂单。
+        返回撤单数量。
+        """
+        canceled = 0
+        for od in list(self.get_pending_orders()):
+            if od.get("instId") != inst_id:
+                continue
+            if self.pos_mode == "long_short" and pos_side:
+                if (od.get("posSide") or "").lower() != pos_side.lower():
+                    continue
+            try:
+                self._call_api(self.trade_api.cancel_order, instId=inst_id, ordId=od["ordId"])
+                canceled += 1
+                logging.info("[CANCEL][PENDING] inst=%s ordId=%s posSide=%s 已撤单",
+                             inst_id, od.get("ordId"), od.get("posSide"))
+            except Exception as e:
+                logging.warning("[CANCEL][PENDING][FAIL] inst=%s ordId=%s err=%s",
+                                inst_id, od.get("ordId"), e)
+        if canceled > 0:
+            logging.info("[CANCEL][SUMMARY] inst=%s 撤销挂单数量=%d (posSide=%s)",
+                         inst_id, canceled, pos_side or "ALL")
+        return canceled
+    # ---------- 新增：直接返回当前仓位列表 ----------
+    _POS_TTL = 1.0   # 1s：避免高并发下的“惊群”，减轻 HTTP/2 连接压力
+
+    def get_positions(self, force: bool = False) -> list[Dict[str, Any]]:
+        """
+        带 TTL 的 positions 查询；singleflight：并发场景下只让一个线程真正打 API。
+        """
+        now = time.monotonic()
+        if not force and now - self._pos_cache["ts"] < self._POS_TTL:
+            return self._pos_cache["data"]
+        # singleflight：进入互斥区后再次检查 TTL，避免惊群
+        with self._pos_lock:
+            now = time.monotonic()
+            if not force and now - self._pos_cache["ts"] < self._POS_TTL:
+                return self._pos_cache["data"]
+            try:
+                resp  = self._call_api(self.account_api.get_positions)
+                data  = resp.get("data", [])
+                if data:
+                    self._last_good_positions = data[:]     # 记录“最后一次成功”
+            except Exception as e:
+                # SDK 在限速 / 502 时常把 HTML 当 JSON 解析 → JSONDecodeError
+                # 把真正的 httpx.Response 挂在 e.__dict__["response"] 的是 HTTPStatusError，
+                # 这里统一抽出来看有没有 status_code
+                status = getattr(e, "response", None)
+                if status and status.status_code == 429:
+                    retry = int(status.headers.get("Retry-After", 1) or 1)
+                    logging.warning("Rate-limit hit, sleep %ss", retry)
+                    time.sleep(retry)
+                    resp  = self._call_api(self.account_api.get_positions)
+                    data  = resp.get("data", [])
+                    if data: self._last_good_positions = data[:]
+                else:
+                    logging.exception("get_positions failed (will return cache): %s", e)
+                    data = self._pos_cache["data"]     # 上一份缓存兜底
+                    # 优先用“最后一次成功”的 positions，其次才是 TTL 缓存
+                    data = self._last_good_positions or self._pos_cache["data"]
+                    # 二次尝试（极短延迟），配合 _rebuild_clients 提升成功率
+                    if not data:
+                        time.sleep(0.4)
+                        try:
+                            resp  = self._call_api(self.account_api.get_positions)
+                            data  = resp.get("data", [])
+                            if data: self._last_good_positions = data[:]
+                        except Exception:
+                            pass
+            self._pos_cache = {"ts": now, "data": data}
+            return data
+    def _get_max_leverage(self, inst_id: str) -> int:
+        """
+        0.4.0 最大可用杠杆优先级：
+          1) AccountAPI.get_leverage_estimated_info / get_adjust_leverage_info → data[0]['maxLever']
+          2) AccountAPI.get_leverage (有的版本叫 get_leverage) → data[*]['maxLever' or 'lever']
+          3) PublicData.get_instruments → data[0]['lever']（理论上限）
+          4) 兜底：self.leverage
+        """
+        # ① 命中本地缓存
+        if inst_id in self._lev_cache:
+            return self._lev_cache[inst_id]
+        # ② 账户侧预估：estimated / adjust（两者择一可用）
+        for _meth in ("get_leverage_estimated_info", "get_adjust_leverage_info"):
+            try:
+                meth = getattr(self.account_api, _meth)
+            except AttributeError:
+                continue
+            try:
+                est = self._call_api(
+                    meth,
+                    instType="SWAP",
+                    mgnMode=self.margin_mode,
+                    lever=str(int(float(self.leverage))),  # 形参必填，给个合法值
+                    instId=inst_id
+                )
+                data = (est or {}).get("data", [])
+                if data:
+                    max_lev = int(float(data[0].get("maxLever", 0)))
+                    if max_lev > 0:
+                        self._lev_cache[inst_id] = max_lev
+                        self._save_leverage_cache()
+                        return max_lev
+            except Exception as e:
+                logging.warning("%s 查询最大杠杆失败: %s", _meth, e)
+
+        # ③ 账户当前杠杆信息
+        for _meth in ("get_leverage", "get_leverage_info"):
+            try:
+                meth = getattr(self.account_api, _meth)
+            except AttributeError:
+                continue
+            try:
+                info = self._call_api(meth, instId=inst_id, mgnMode=self.margin_mode)
+                rows = (info or {}).get("data", [])
+                cand = max((int(float(r.get("maxLever", r.get("lever", 0) or 0))) for r in rows), default=0)
+                if cand > 0:
+                    self._lev_cache[inst_id] = cand
+                    self._save_leverage_cache()
+                    return cand
+            except Exception as e:
+                logging.warning("account.%s 失败: %s", _meth, e)
+
+        # ④ PublicData：读取 instruments 的 lever（理论上限）
+        try:
+            pub = self._call_api(self.public_api.get_instruments, instType="SWAP", instId=inst_id)
+            if pub.get("code") == "0" and pub.get("data"):
+                lev_str = (pub["data"][0].get("lever") or "").strip()
+                max_lev = int(float(lev_str)) if lev_str else 0
+                if max_lev > 0:
+                    self._lev_cache[inst_id] = max_lev
+                    self._save_leverage_cache()
+                    return max_lev
+        except Exception as e:
+            logging.warning("public.get_instruments 读取 lever 失败: %s", e)
+
+        # ③ 账户侧预估接口：adjust-leverage-info（字段包含 maxLever/minLever）
+        #    SDK 在不同版本里方法名可能不同，这里双尝试以兼容 0.4.0
+   
+        logging.warning("最大杠杆查询失败，回退到本地配置 leverage=%s", self.leverage)
+        return int(float(self.leverage))
+    # ---------- 统一的滑点价格计算 ----------
+    def _with_slip_for_side(self, pos_side: str, base_px: float) -> float:
+        """
+        给定方向(pos_side='long'|'short')与基准价，返回带滑点后的委托价。
+        long → 基准价*(1-ENTRY_SLIP)，short → 基准价*(1+ENTRY_SLIP)
+        """
+        try:
+            s = abs(float(self.ENTRY_SLIP or 0.0))
+        except Exception:
+            s = 0.0
+        if s <= 0: return float(base_px)
+        return float(base_px) * (1 - s) if str(pos_side).lower() == "long" else float(base_px) * (1 + s)
+
+    # ---------- 新增：快速/缓存读取初始保证金比率（imr） ----------
+    def _get_imr_fast(self, inst_id: str, lev: float) -> float:
+        """
+        以 TTL 缓存方式读取 imr；常态直接命中本地缓存。
+        失败或无数据回退到 1/lev，并与 1/lev 取更严格者。
+        返回值已是“有效 imr”（等于 max(1/lev, imr_from_api)）。
+        """
+        try:
+            now = time.time()
+            st = self._tier_cache.get(inst_id)
+            if st and (now - float(st.get("ts", 0.0))) < max(0.0, float(self.TIER_TTL)):
+                # 兼容旧字段名 "imr"：若存在则当作 api_imr 使用
+                imr_api = float(st.get("imr_api") or st.get("imr") or 0.0)
+                return max(1.0/float(lev or 1.0), imr_api if imr_api > 0 else 0.0)
+        except Exception:
+            pass
+        # 未命中或过期 → 轻查一次；失败兜底 1/lev
+        imr = 0.0
+        try:
+            _uly = "-".join(inst_id.split("-")[:2])
+            r = self._call_api(self.public_api.get_position_tiers, instType="SWAP", uly=_uly, tdMode=self.margin_mode)
+            if r.get("code") == "0" and (r.get("data") or []):
+                imr = float((r["data"][0].get("imr") or 0) or 0)
+        except Exception:
+            imr = 0.0
+        eff_imr = max(1.0/float(lev or 1.0), float(imr or 0.0))
+        self._tier_cache[inst_id] = {"imr_api": float(imr or 0.0), "ts": time.time()}
+        return eff_imr
+
+    def _safe_last_price(self, inst_id: str) -> float | None:
+        """
+        可靠地取最新价；优先使用 WS/MQ 缓存（低延迟），过期或缺失再回退 REST。
+        出错或无数据返回 None（调用方自行兜底）。
+        """
+        # ① 先读本地 WS/MQ 价缓存（时效内）
+        try:
+            rec = self._px_cache.get(inst_id)
+            if rec:
+                ts = float(rec.get("ts", 0.0) or 0.0)
+                if ts > 0 and (time.time() - ts) <= max(0.0, float(self.WS_PX_TTL)):
+                    # 有 last 用 last，否则 bid/ask 求中价
+                    if "last" in rec:
+                        px = float(rec["last"])
+                        if px > 0:
+                            return px
+                    if "bid" in rec and "ask" in rec:
+                        b = float(rec["bid"]); a = float(rec["ask"])
+                        mid = (a + b) / 2.0
+                        if mid > 0:
+                            return mid
+        except Exception:
+            pass
+        # ② 回退 REST
+        try:
+            tick = self._call_api(self.market_api.get_ticker, instId=inst_id)
+            data = (tick or {}).get("data") or []
+            if not data: return None
+            px = float((data[0].get("last") or data[0].get("lastPx") or data[0].get("px") or 0) or 0)
+            return px if px > 0 else None
+        except Exception:
+            return None
+    # ---------- 辅助工具 ----------
+    def _bootstrap_open_orders(self):
+        """启动时加载 *未成交* 挂单进缓存（避免漏判同向委托）"""
+        # ----------------------------------------------------------
+        # ① 优先使用 /trade/orders-pending（SDK ≥ 0.3.8 才有）
+        # ② 若 SDK 版本较旧，则回退到 get_order_list，并手动过滤
+        # ----------------------------------------------------------
+        if hasattr(self.trade_api, "get_orders_pending"):
+            resp = self._call_api(self.trade_api.get_orders_pending)
+        else:
+            resp = self._call_api(self.trade_api.get_order_list)
+
+        pending_states = {"live","partially_filled"}  # filled 不是未成交，别缓存
+        for od in resp.get("data", []):
+            if od.get("state") in pending_states:            # 仅缓存未成交委托
+                self.orders[od["ordId"]] = od
+
+    def _bootstrap_positions(self):
+        """启动时加载当前持仓（用 key=pos_... 仅做存在性判断）"""
+        resp = self._call_api(self.account_api.get_positions)
+        for pos in resp.get("data", []):
+            key = f"pos_{pos['instId']}_{pos['posSide']}"
+            self.orders[key] = pos
+
+    def _record_order(self, order_resp: Dict[str, Any]):
+        """下单或查询后，把订单信息写入缓存"""
+        if order_resp.get("code") == "0" and order_resp["data"]:
+            self.orders[order_resp["data"][0]["ordId"]] = order_resp["data"][0]
+
+    def _refresh_order_state(self, inst_id: str, ord_id: str) -> str:
+        """查询订单最新状态并返回 state 字段"""
+        resp = self._call_api(self.trade_api.get_order, instId=inst_id, ordId=ord_id)
+        if resp.get("code") == "0" and resp["data"]:
+            self._record_order(resp)
+            return resp["data"][0]["state"]
+        return "unknown"
+
+    def query_pairs(self, keyword: str, inst_type: str = "SWAP") -> list:
+        """
+        查询交易对（默认合约 SWAP），按关键字过滤
+
+        - SDK ≥ 0.3.8: MarketAPI.get_instruments()
+        - SDK ≤ 0.3.7: MarketAPI.get_tickers()
+        """
+        try:
+            if hasattr(self.public_api, "get_instruments"):
+                resp = self._call_api(self.public_api.get_instruments, instType=inst_type)
+                logging.debug("[PAIR_LOOKUP] 使用 get_instruments() instType=%s", inst_type)
+            elif hasattr(self.market_api, "get_tickers"):
+                resp = self._call_api(self.market_api.get_tickers, instType=inst_type)
+                logging.debug("[PAIR_LOOKUP] get_instruments 不存在，降级到 get_tickers() instType=%s", inst_type)
+            else:
+                logging.error("MarketAPI 既无 get_instruments 也无 get_tickers —— 请检查 python-okx 版本")
+                return []
+        except Exception as e:
+            logging.exception("MarketAPI 查询失败: %s", e)
+            return []
+
+        data = resp.get("data", [])
+        base = keyword.upper()
+        # -------- 只选 USDT-本位永续，且 base 精确匹配 -------- #
+        results = []
+        for item in data:
+            inst = item.get("instId","").upper()
+            if not inst.endswith("USDT-SWAP"):
+                continue
+            parts = inst.split("-")   # 形如 BASE-USDT-SWAP
+            if len(parts) >= 3 and parts[0] == base:
+                results.append(item)
+        return results
+
+    def get_balance(self) -> list:
+        """
+        查询账户余额
+        """
+        resp = self._call_api(self.account_api.get_account_balance)
+        return resp.get("data", [])
+    # ---------- 新增：获取可用 USDT 余额 ----------
+    def _get_available_usdt(self) -> float:
+        """
+        OKX /account/balance 返回格式：
+       [
+          {
+            'details': [
+              { 'ccy':'USDT', 'availEq':'54.4', ... },
+               ...
+            ],
+            ...             # 外层没有 ccy 字段
+          },
+          ...
+        ]
+        """
+        balances = self.get_balance()
+        for row in balances:
+            # 部分版本在外层就带 ccy（极少），先检查一下
+            if row.get("ccy", "").upper() == "USDT":
+                return float(row.get("availEq") or row.get("availBal") or 0)
+
+            # 常见结构：ccy 在 details 里
+            for det in row.get("details", []):
+                if det.get("ccy", "").upper() == "USDT":
+                    return float(det.get("availBal") or det.get("availEq") or 0)
+
+        return 0.0
+
+    def open_position(
+        self, inst_id: str, price: float, size: float, side: str,
+        mq_lev: int | None = None                # ← 新增：来自 MQ 的杠杆
+    ) -> dict:
+        """
+        开仓（限价单）；side="buy" 开多，"sell" 开空
+        自动设置杠杆
+        """
+
+        pos_side = "long" if side.lower() == "buy" else "short"
+        self._ensure_leverage(inst_id, pos_side, mq_lev)
+        # 下限价单开仓
+        # ---------- 根据持仓模式决定是否携带 posSide ----------
+        order_params = dict(
+            instId=inst_id,
+            tdMode=self.margin_mode,
+            side=side,
+            ordType="limit",
+            px=str(price),
+            sz=str(size)
+        )
+        if self.pos_mode == "long_short":
+            order_params["posSide"] = pos_side
+
+        resp = self._call_api(self.trade_api.place_order, **order_params)
+        self._record_order(resp)
+        return resp
+        
+    def close_position(self, inst_id: str, ord_id: str) -> dict:
+        """
+        智能平仓：
+          • 挂单未成交 -> 撤单
+          • 订单已成交 -> reduceOnly 限价反向对冲
+        """
+        state = self._refresh_order_state(inst_id, ord_id)
+
+        # 1) 未成交 -> 撤单
+        if state in {"live", "partially_filled"}:
+            return self._call_api(
+                self.trade_api.cancel_order,
+                instId=inst_id,
+                ordId=ord_id
+            )
+
+        # 2) 已全部成交 -> 反向平仓
+        if state == "filled":
+            origin = self.orders[ord_id]
+            opp_side = "sell" if origin["side"].lower() == "buy" else "buy"
+            # 取最新市价作限价基准
+            last_px = str(self._safe_last_price(inst_id) or 0)
+            order_params = dict(
+                instId=inst_id,
+                tdMode=self.margin_mode,
+                side=opp_side,
+                ordType="limit",
+                px=last_px,
+                sz=origin["sz"],
+                reduceOnly="true"
+            )
+            if self.pos_mode == "long_short":
+                order_params["posSide"] = origin.get("posSide")
+
+            resp = self._call_api(self.trade_api.place_order, **order_params)
+            self._record_order(resp)
+            return resp
+
+        raise ValueError(f"订单 {ord_id} 状态未知，无法平仓")
+
+    def add_position(
+        self, inst_id: str, price: float, size: float, side: str,
+        mq_lev: int | None = None
+    ) -> dict:
+        """加仓：再次开仓（可携带 mq_lev）"""
+        return self.open_position(inst_id, price, size, side, mq_lev=mq_lev)
+
+    def reduce_position(self, inst_id: str, price: float, size: float, side: str) -> dict:
+        """
+        减仓：以相反方向限价单平掉指定方向的仓位
+        """
+        # 平多则卖出；平空则买入
+        opp_side = "sell" if side.lower() == "buy" else "buy"
+        # 对冲模式下，posSide 必须显式注明 “被平掉的方向”
+        # buy → 平掉 long 仓位；sell → 平掉 short 仓位
+        pos_side = "long" if side.lower() == "buy" else "short"
+        order_params = dict(
+            instId=inst_id,
+            tdMode=self.margin_mode,
+            side=opp_side,
+            ordType="limit",
+            px=str(price),
+            sz=str(size),
+            reduceOnly="true"
+        )
+        if self.pos_mode == "long_short":
+            order_params["posSide"] = pos_side
+
+        resp = self._call_api(self.trade_api.place_order, **order_params)
+        self._record_order(resp)
+        return resp
+
+    # ---------- 新增：查询进行中交易 ----------
+    def get_active_trades(self) -> list[Dict[str, Any]]:
+        """
+        返回当前仍在进行中的委托或仓位：
+        - 订单状态在 live / partially_filled / filled 之间
+        - 剔除已 canceled、已平仓或已归档订单
+        """
+        # 1) 刷新挂单 & 持仓缓存
+        self._bootstrap_open_orders()
+        self._bootstrap_positions()
+
+        active_states = {"live", "partially_filled", "filled"}
+        active_list = [
+            od for od in self.orders.values()
+            if od.get("state", "live") in active_states          # 委托
+               or od.get("pos") not in (None, "0")               # 持仓
+        ]
+        return active_list
+
+    def parse_wallet_event(self, evt: dict):
+        """
+        根据消息类型解析 wallet 事件，框架仅含分支，后续填充分支逻辑
+        """
+        # 入口诊断：确认 MQ 事件抵达与关键字段
+        # logging.info(
+        #     "[MQ_EVT] etype=%s event=%s coin=%s midPx=%s changed=%s lev=%s raw_id=%s",
+        #     evt.get("etype"), evt.get("event"), evt.get("coin"),
+        #     (evt.get("midPx") or evt.get("px") or evt.get("last")),
+        #     evt.get("changed"), (evt.get("lev") or evt.get("leverage")),
+        #     evt.get("msg_id")
+        # )
+
+        # 若配置了过滤币种，则这些币种的所有事件一律忽略
+        coin_for_filter = (evt.get("coin") or evt.get("asset") or "").upper()
+        if coin_for_filter and self._is_filtered_coin(coin_for_filter):
+            # logging.info("[FILTER][DROP] coin=%s etype=%s event=%s",
+            #              coin_for_filter, evt.get("etype"), evt.get("event"))
+            return        
+        # 若该币在 miss TTL（本交易所没有该 SWAP），丢弃除 MONITOR_STATUS 以外的事件
+        if coin_for_filter and self._skip_miss_coin(coin_for_filter):
+            etype = evt.get("etype")
+            event = evt.get("event")
+            with suppress(Exception):
+                self._maybe_update_px_cache_from_evt(evt, evt.get("instId"))
+            if event != "MONITOR_STATUS":
+                logging.info("[MISS][DROP] coin=%s no SWAP on OKX (TTL) — skip %s/%s",
+                             coin_for_filter, etype, event)
+                return
+            # 允许 MONITOR_STATUS 继续，以便把监控状态强制改为 false
+
+        etype = evt.get("etype")
+        event = evt.get("event")
+        
+        # === 新增：生产端监控状态 ===
+        if event == "MONITOR_STATUS":
+            self._handle_monitor_status(evt)
+            return
+        # 事件若携带 vol.atr_pct，先更新波动缓存（需 instId，稍后各 handler 内也会再次更新）
+        try:
+            if isinstance(evt.get("vol"), dict) and "atr_pct" in evt["vol"]:
+                inst_id_try = evt.get("instId") or None
+                if inst_id_try:
+                    self._vol_cache[inst_id_try] = {"atr_pct": float(evt["vol"]["atr_pct"]), "ts": time.time()}
+        except Exception:
+            pass
+
+        # 1. FILL 系列：OPEN / CLOSE
+        if etype == "FILL":
+            if event == "OPEN":
+                # logging.info(
+                #     "[PARSE_EVT] etype=%s event=%s side=%s keys=%s raw=%s",
+                #     etype, event, evt.get("side"), list(evt.keys()), evt
+                # )
+                self._handle_fill_open(evt)
+            elif event == "CLOSE":
+                logging.info(
+                     "[PARSE_CLOSE_EVT] raw=%s", evt
+                )
+                self._handle_fill_close(evt)
+
+        # 2–5. SIZE 系列：OPEN / INC / DEC / REVERSE
+        elif etype == "SIZE":
+            if event == "OPEN":          # ← 新增：SIZE+OPEN 也当作开仓事件
+                logging.info(
+                     "[PARSE_SIZE_OPEN_EVT] raw=%s", evt
+                )
+                self._handle_fill_open(evt)
+            elif event == "INC":
+                logging.info(
+                     "[PARSE_SIZE_INC_EVT] raw=%s", evt
+                )
+                self._handle_size_inc(evt)
+            elif event == "DEC":
+                logging.info(
+                     "[PARSE_SIZE_DEC_EVT] raw=%s", evt
+                )
+                self._handle_size_dec(evt)
+            elif event == "REVERSE":
+                logging.info(
+                     "[PARSE_SIZE_REVERSE_EVT] raw=%s", evt
+                )
+                self._handle_size_reverse(evt)
+
+        # 6. INFO 系列：其他信息变化
+        elif etype == "INFO":
+            self._handle_info(evt)
+
+        else:
+            logging.info("event是none的信息=%s", evt)
+
+    # ---------- 新增：FILL-OPEN 下单逻辑 ----------
+    def _handle_fill_open(self, evt: dict):
+        """
+        MQ 事件 etype=="FILL" 且 event=="OPEN" 时触发本方法：
+        1. 计算钱包该 coin 相对全仓价值占比
+        2. 若本账户无该币种仓位，则按占比 * BUDGET_RATIO 的可支配余额开仓
+        """
+        positions = self.get_positions()  # 单次复用
+        coin   = evt.get("coin", "").upper()
+        szi    = float(evt.get("snapshot", {}).get("szi", 0))
+        entry  = float(evt.get("snapshot", {}).get("entryPx", evt.get("px", 0)) or 0)
+
+        logging.info(
+            "[OPEN_EVT] coin=%s side=%s szi=%s entryPx=%s raw=%s",
+            coin, evt.get("side"), szi, entry, evt
+        )
+
+        if szi == 0 or entry == 0:
+            logging.warning("OPEN event 缺少 szi/entryPx，跳过")
+            return
+
+        # 记录主钱包该币最新 szi，便于后续 INC/DEC 按比例跟随
+        self._last_szi[coin] = abs(szi)
+        # 2) 获取 / 缓存 instId（带负缓存）
+        inst_id = self._get_inst_id(coin)
+        if not inst_id:
+            return
+        # 合并特征（ATR% / 多时段 VP / 邻近 HVN/LVN）
+        with suppress(Exception):
+            self._merge_feat_into_event(inst_id, evt)
+        # 更新本合约的 ATR%（如 MQ 带有 vol.atr_pct）
+        try:
+            if isinstance(evt.get("vol"), dict) and "atr_pct" in evt["vol"]:
+                self._vol_cache[inst_id] = {"atr_pct": float(evt["vol"]["atr_pct"]), "ts": time.time()}
+        except Exception:
+            pass
+        # 开新仓即重置收益/止损保护阶梯
+        side_flag = (evt.get("side") or "-").upper()
+        if side_flag in ("LONG","SHORT"):
+            pos_side = "long" if side_flag=="LONG" else "short"
+            self._pp_hits[self._pp_key(inst_id, pos_side)] = 0
+            self._save_profit_guard_state()
+            self._lp_hits[self._pp_key(inst_id, pos_side)] = 0
+            self._save_loss_guard_state()
+            # 新开仓：清理该方向的“价格去重”点，避免沿用上一轮的触发价
+            self._pp_last_px.pop(self._pp_key(inst_id, pos_side), None)
+            self._save_profit_guard_px_state()
+            self._lp_last_px.pop(self._pp_key(inst_id, pos_side), None)
+            self._save_loss_guard_px_state()
+            # MFE/滞回/冷却状态重置
+            mfe_key = f"{inst_id}:{pos_side}"
+            self._mfe_peak.pop(mfe_key, None)
+            self._mfe_hits.pop(mfe_key, None)
+            self._hys_state_pp.pop(mfe_key, None)
+            self._hys_state_lp.pop(mfe_key, None)
+            self._cooldown_ts.pop(mfe_key, None)
+            # MFE A+B 状态重置
+            self._mfe_last_roe.pop(mfe_key, None)
+            self._mfe_gated.pop(mfe_key, None)
+            self._mfe_last_peak_trig.pop(mfe_key, None)
+        max_lev, ct_val, ct_ccy, min_sz = self._get_inst_spec(inst_id)
+
+        # ---------- MQ 杠杆（可能为空） ----------
+        mq_lev_raw = (evt.get("lev") or evt.get("leverage")
+                      or evt.get("snapshot", {}).get("lev")
+                      or evt.get("snapshot", {}).get("leverage"))
+        mq_lev = int(float(mq_lev_raw)) if mq_lev_raw else None
+        # 用与下单一致的规则选出“本次实际杠杆”，传给 RG 做 ROE↔价差换算
+        selected_lev = self._select_leverage(max_lev, mq_lev)
+
+
+        # ---------- 提前拿到方向 ----------
+        # 更稳：消息里偶尔缺 side，直接丢弃该 OPEN
+        side_flag = (evt.get("side") or "-").upper()  # "LONG"/"SHORT"
+        if side_flag not in ("LONG","SHORT"):
+            logging.warning("[OPEN_EVT] 缺少有效 side，跳过：%s", evt.get("side"))
+            return
+
+        # === 反向开单拦截：若已有本地相反方向持仓或挂单，直接跳过 ===
+        opp_pos_side = "short" if side_flag == "LONG" else "long"
+        has_opp = False
+        for pos in positions:
+            if pos.get("instId")==inst_id and self.pos_mode=="long_short" and pos.get("posSide","").lower()==opp_pos_side:
+                if abs(float(pos.get("pos",0) or 0))>0: has_opp=True; break
+        if not has_opp:
+            for od in self.get_pending_orders():
+                if od.get("instId")==inst_id and od.get("posSide","").lower()==opp_pos_side:
+                    if od.get("state") in {"live","partially_filled"}: has_opp=True; break
+        if has_opp:
+            logging.warning("[OPEN_EVT][BLOCK] 拦截反向开单 inst=%s side=%s：已存在相反方向的本地暴露", inst_id, side_flag)
+            return
+
+        # 先准备兜底价与滑点，供 RG 失败或非法价时使用
+
+        last_px = self._fresh_evt_px(evt) or self._safe_last_price(inst_id)
+        if last_px is None:
+            logging.warning("[TICKER][EMPTY] inst=%s 用 entryPx 兜底；本次跳过开仓", inst_id)
+            return
+        s = abs(self.ENTRY_SLIP)
+
+        use_vp = self._is_monitored(inst_id=inst_id, coin=coin)
+        if use_vp:
+            try:
+
+                rg_out = quick_eval_from_event(
+                    evt,
+                    leverage=float(selected_lev),
+                    min_roe_gap_pct=self.RG_MIN_ROE_GAP_PCT,
+                    node_min_roe_pct=self.RG_MIN_ROE_GAP_PCT,
+                )
+                order_px = float(rg_out["entry_adj"])
+                # 记录 VP 级别用于后续 INFO 中的盈利/止损保护
+                key = f"{inst_id}:{'long' if side_flag=='LONG' else 'short'}"
+                self._vp_levels[key] = {
+                    "entry_adj": order_px,
+                    # 保留 SL，移除 TP，盈利由 HVN/回退处理
+                    "sl": list(map(float, rg_out.get("sl", [])[:3])),
+                    # 多时段节点（HVN/LVN）
+                    "tp_nodes": list(map(float, (rg_out.get("nodes", {}) or {}).get("tp_nodes", [])[:3])),
+                    "sl_nodes": list(map(float, (rg_out.get("nodes", {}) or {}).get("sl_nodes", [])[:3])),
+                    # 保护参考：RG 基于 VA/ATR 给出的回退价
+                    "guards": {
+                        "profit_protect_ref": (rg_out.get("guards", {}) or {}).get("profit_protect_ref"),
+                        "loss_protect_ref": (rg_out.get("guards", {}) or {}).get("loss_protect_ref"),
+                    },
+                }
+
+                self._node_tp_hits[key] = 0
+                self._node_sl_hits[key] = 0
+                logging.info("[RG] inst=%s side=%s entry_adj=%.8f sl=%s anchors=%s",
+                             inst_id, side_flag, order_px,
+                             self._vp_levels[key]["sl"], rg_out.get("anchors"))
+                logging.info("[RG][NODES] hvn(tp)=%s  lvn(sl)=%s",
+                              self._vp_levels[key]["tp_nodes"], self._vp_levels[key]["sl_nodes"])
+            except Exception as e:
+                # 回退：不做 VP 修正
+                base_px = entry if (side_flag=="LONG" and entry<last_px) or (side_flag=="SHORT" and entry>last_px) else last_px
+                order_px = base_px * (1 - s) if side_flag == "LONG" else base_px * (1 + s)
+                logging.warning("[RG][FALLBACK] %s", e)
+        else:
+            # 未监控：禁用 VP 修正，清理状态，按滑点下单
+            base_px = entry if (side_flag=="LONG" and entry<last_px) or (side_flag=="SHORT" and entry>last_px) else last_px
+            order_px = base_px * (1 - s) if side_flag == "LONG" else base_px * (1 + s)
+            self._clear_vp_state(inst_id)
+
+        # ②½ 入场价保护：无论是否使用 VP/RG，均根据急跌/急涨场景对入场价做保护性下/上移
+        try:
+            baseline_before_ep = float(order_px)
+            # baseline 若来自 RG（上面 use_vp==True），一般未加滑点 → 在 EP 中也用 slip=0
+            slip_used = 0.0 if use_vp else float(s)
+            order_px = self._protected_entry_price(
+                inst_id=inst_id,
+                side_flag=side_flag,                # "LONG" / "SHORT"
+                baseline_px=baseline_before_ep,
+                last_px=float(last_px),
+                slip=slip_used,
+            )
+            logging.debug("[EP] inst=%s side=%s baseline=%.8f → protected=%.8f (last=%.8f, slip=%.5f, vp=%s)",
+                          inst_id, side_flag, baseline_before_ep, float(order_px), float(last_px), slip_used, use_vp)
+        except Exception as _e:
+            logging.debug("[EP][OPEN][SKIP] %s", _e)
+
+        # ③ 保护：若最终价格非法则跳过
+        if order_px <= 0:
+            logging.warning("order_px 非法（entry=%.8f, last=%.8f, slip=%.6f）",
+                            entry, last_px, s)
+            return
+
+        # === 更新钱包价值缓存 & 重新计算 proportion ===
+        self._wallet_value[coin] = abs(szi) * entry
+        total_value = sum(self._wallet_value.values())
+        if total_value == 0:
+            logging.warning("总仓位价值为 0，跳过下单")
+            return
+        proportion = self._wallet_value[coin] / total_value
+
+        logging.info(
+            "[OPEN_EVT] wallet_value[%s]=%.4f, total=%.4f, proportion=%.4f",
+            coin, self._wallet_value[coin], total_value, proportion
+        )
+
+        # 3) 统计同向「已持仓 + 未成交挂单」，后面只为 *缺口* 下单
+        desired_side  = "buy" if side_flag == "LONG" else "sell"
+        curr_contract = 0.0      # 现有仓位（张）
+        pending_same  = 0.0      # 未成交挂单（张）
+
+        # a) 当前已持仓（按方向聚合）
+        expect_pos = "long" if side_flag == "LONG" else "short"
+        for pos in positions:
+            if pos.get("instId") != inst_id:
+                continue
+            if self.pos_mode == "long_short":
+                if pos.get("posSide", "").lower() != expect_pos:
+                    continue
+            curr_contract += abs(float(pos.get("pos", 0) or 0))
+
+        # b) 未成交同向委托
+        for od in self.get_pending_orders():
+            if od.get("instId") != inst_id:
+                continue
+            if od.get("side", "").lower() != desired_side:
+                continue
+            if self.pos_mode == "long_short":
+                expect_pos = "long" if side_flag == "LONG" else "short"
+                if od.get("posSide", "").lower() != expect_pos:
+                    continue
+            unfilled = float(od.get("sz", 0)) - float(od.get("accFillSz", 0) or 0)
+            pending_same += max(unfilled, 0)
+
+        logging.info("[OPEN_EVT] existing=%.4f  pending=%.4f (contracts)", curr_contract, pending_same)
+     
+        # —— 冷启动硬性去重：若仍在暖身期且已有同向持仓或挂单，就不再追加 —— #
+        if self._in_warmup() and (curr_contract > 0 or pending_same > 0):
+            # 暖身期即使跳过开单，也先把杠杆调到位（与后续实际下单保持一致）
+            try:
+                pos_side_for_lev = "long" if side_flag == "LONG" else "short"
+                self._ensure_leverage(inst_id, pos_side_for_lev, mq_lev)
+            except Exception as _e:
+                logging.debug("[OPEN_EVT][warmup][ensure_lev][skip] %s", _e)
+            logging.info(
+                "[OPEN_EVT] warmup skip: uptime=%.2fs, keep existing pending/pos only",
+                time.time() - self._start_ts
+            )
+            return
+        # 4) 获取余额，取 50% * 占比 作为下单价值
+        # -------- 4) 计算当前可用 USDT 与本次预算 --------
+        avail_usdt = self._get_available_usdt()
+        logging.info("当前可用 USDT=%.8f", avail_usdt)
+        if avail_usdt == 0:
+            logging.error("USDT 余额为 0，无法下单")
+            return
+        # ==== 资金分桶规则 ====
+        reserve_usdt  = max(self.RESERVE_MIN_USDT,
+                            avail_usdt * self.RESERVE_RATIO)
+        tradeable     = max(0, avail_usdt - reserve_usdt)
+
+        # ────────────────────────────────────────────────
+        # 方案 1：一次性按 master 钱包权重复制
+        #   仍按权重复制，但只动用可支配资金的 BUDGET_RATIO（25%）
+        # ────────────────────────────────────────────────
+        budget_usdt   = tradeable * self.BUDGET_RATIO * proportion
+        logging.info(
+            "[WEIGHT_COPY] tradeable=%.4f USDT  proportion=%.4f  → budget=%.4f USDT",
+            tradeable, proportion, budget_usdt
+        )
+        # 优化 4：按波动率缩放预算（atr 越大，预算越小；risk-parity 近似）
+        budget_usdt *= self._budget_scale_by_vol(inst_id)
+        if budget_usdt <= 0:
+            logging.warning("预算 ≤ 0（reserve_usdt=%.4f），跳过下单", reserve_usdt)
+            return
+
+
+        # 5) 计算下单张数（让保证金≈budget_usdt）
+        # 与下单保持一致的杠杆，避免“下单与预算计算”不一致
+        lev = selected_lev
+        # === 折扣系数：查询 tier，得到初始保证金比率 imr（走 PublicData）===
+        # === 新：imr 走 TTL 缓存（常态不查 HTTP） ===
+        eff_imr = self._get_imr_fast(inst_id, lev)
+
+        # === 每张名义价值 → 预算能买几张 ===
+        notional     = ct_val if ct_ccy.upper() == "USDT" else ct_val * order_px
+        raw_contracts = budget_usdt / (notional * eff_imr)
+        contracts = max(1, int(raw_contracts))               # 必须整数
+
+        # --- 如果保证金仍不足，逐步递减 contracts ---
+        tradeable = max(0, avail_usdt - reserve_usdt)        # 已在上文算过
+        while contracts > 0:
+            need_margin = contracts * notional * eff_imr
+            if need_margin <= tradeable:
+                break
+            contracts -= 1
+        if contracts == 0:
+            logging.info("保证金不足，跳过下单")
+            return
+
+        if contracts < min_sz:                               # 不足最小下单量
+            contracts = math.ceil(min_sz)
+
+        # ⑥ 计算缺口：目标 contracts − 已持仓 − 未成交挂单
+        shortage = contracts - curr_contract - pending_same
+        if shortage <= 0:
+            logging.info("目标=%s 已持=%.4f 挂单=%.4f ⇒ 无需再下单", contracts, curr_contract, pending_same)
+            return
+
+        # 不低于最小下单量
+        if shortage < min_sz:
+            shortage = math.ceil(min_sz)
+
+        size = str(shortage)
+
+        logging.info(
+            "[SIZE_CALC] budget=%.4f USDT  lev=%s×  → contracts=%s  notional/ct=%.2f",
+            budget_usdt, lev, contracts, notional
+        )
+
+        side = desired_side
+
+        # ---------- 按全局 mode 决定是否真实下单 ----------
+        if mode == "test":
+            logging.info(
+                "[TEST MODE] Would open position: inst_id=%s, price=%s, size=%s, side=%s",
+                inst_id, order_px, size, side
+            )
+            resp = {
+                "code": "0",
+                "msg": "test mode - order not sent",
+                "data": [{
+                    "instId": inst_id,
+                    "px": str(order_px),
+                    "sz": str(size),
+                    "side": side
+                }]
+            }
+        else:  # mode == "real"
+            resp = self.open_position(
+                inst_id=inst_id,
+                price=order_px,
+                size=size,
+                side=side,
+                mq_lev=mq_lev
+            )
+            logging.info("自动开仓 resp=%s", resp)
+
+        return resp
+
+    # ============================================================
+    #  新增：通用辅助 —— coin → instId（带本地缓存）
+    # ============================================================
+    def _get_inst_id(self, coin: str) -> str | None:
+        coin = coin.upper()
+        # 过滤币种直接返回 None，后续逻辑会自然跳过
+        if self._is_filtered_coin(coin):
+            #logging.info("[INST_ID][DROP] coin=%s in filter_tokens", coin)
+            return None
+        # ① 负缓存命中：TTL 内不再查询
+        if self._skip_miss_coin(coin):
+            ttl = max(0, int(self.MISS_TTL - (time.time() - self._pair_miss.get(coin, 0))))
+            logging.info("[INST_ID][MISS_CACHE] coin=%s still in TTL ~%ss", coin, ttl)
+            return None
+        # ② 命中正常缓存
+        inst_id = self._pair_cache.get(coin)
+        if inst_id:
+            logging.debug("[INST_ID][HIT] coin=%s -> instId=%s (cache)", coin, inst_id)
+            return inst_id
+        # ③ 走接口查询
+        pairs = self.query_pairs(coin, inst_type="SWAP")
+        if not pairs:
+            # 记录 miss，并限流输出日志（避免刷屏）
+            logging.info("[INST_ID][MISS] coin=%s no USDT-SWAP found (record miss)", coin)
+            self._note_miss_coin(coin)
+            # 强制标记该币未监控，避免进入 VP/HVN 监控流程
+            try:
+                self._monitored_coin[coin] = False
+                self._monitor_last[coin] = {
+                    "monitored": False, "reason": "no_swap_on_okx",
+                    "ts": time.time(), "coin": coin, "instId": ""
+                }
+                # 清理与该币前缀相关的 VP/HVN/LVN 状态
+                for k in list(self._vp_levels.keys()):
+                    inst = k.split(":")[0]
+                    if inst.startswith(f"{coin}-") and k.endswith((":long", ":short")):
+                        self._clear_vp_state(inst)
+            except Exception:
+                pass
+            return None
+        inst_id = pairs[0]["instId"]
+        self._pair_cache[coin] = inst_id
+        logging.debug("[INST_ID][HIT] coin=%s -> instId=%s", coin, inst_id)
+        # 找到了就清理 miss 记录（以便下次正常查询）
+        self._pair_miss.pop(coin, None)
+        self._miss_log_ts.pop(coin, None)
+        return inst_id
+
+    # ============================================================
+    #  MONITOR_STATUS → 生产端监控状态
+    # ============================================================
+    def _handle_monitor_status(self, evt: dict):
+        """
+        {
+          "event": "MONITOR_STATUS",
+          "instId": "<OKX instId>",
+          "coin": "<BASE>",
+          "monitored": true|false,
+          "reason": "<book_ready | no_swap_on_okx | ws_subscribe_error:CODE | ...>",
+          "ts": <epoch_ms>
+        }
+        """
+        inst_id  = (evt.get("instId") or "").upper()
+        coin     = (evt.get("coin") or "").upper()
+        monitored = bool(evt.get("monitored"))
+        reason    = evt.get("reason") or ""
+        ts        = float(evt.get("ts") or 0.0)
+        # 若上游声明/本地确认该币在 OKX 无 USDT-SWAP，强制关闭监控
+        force_unmon = False
+        if reason.startswith("no_swap_on_okx") or (coin and self._skip_miss_coin(coin)):
+            force_unmon = True
+        # 双检：如果声称 monitored=true，但本地也解析不到 instId，则当作无此合约
+        if monitored and not force_unmon:
+            try:
+                # 优先用 coin 解析 OKX instId；解析不到则视为没有该合约
+                okx_id = self._get_inst_id(coin) if coin else (inst_id or None)
+            except Exception:
+                okx_id = None
+            if not okx_id:
+                force_unmon = True
+                if not reason:
+                    reason = "no_swap_on_okx"
+        if force_unmon:
+            monitored = False
+            # 清理 VP/HVN/LVN 状态
+            if inst_id:
+                self._clear_vp_state(inst_id)
+            elif coin:
+                for k in list(self._vp_levels.keys()):
+                    inst = k.split(":")[0]
+                    if inst.startswith(f"{coin}-"):
+                        self._clear_vp_state(inst)
+        if inst_id:
+            self._monitored_inst[inst_id] = monitored
+        if coin:
+            self._monitored_coin[coin] = monitored
+        self._monitor_last[inst_id or coin or ""] = {
+            "monitored": monitored, "reason": reason, "ts": ts, "coin": coin, "instId": inst_id
+        }
+
+        if not monitored:
+            logging.info("[MONITOR_STATUS] inst=%s coin=%s monitored=%s reason=%s → 标记为未监控（无 VP/HVN 流程）",
+                         inst_id or "(n/a)", coin or "(n/a)", monitored, reason)
+        else:
+            logging.info("[MONITOR_STATUS] inst=%s coin=%s monitored=%s reason=%s", inst_id or "(n/a)", coin or "(n/a)", monitored, reason)
+
+
+    # ============================================================
+    #  SIZE-INC → 加仓
+    # ============================================================
+    def _handle_size_inc(self, evt: dict):
+        coin   = evt.get("coin", "").upper()
+        side   = evt.get("side", "-").upper()          # LONG / SHORT
+        # MQ 里偶尔会出现 snapshot.szi 为 None/""，需做健壮处理
+        positions = self.get_positions()  # 单次复用
+        szi_raw = evt.get("snapshot", {}).get("szi")
+        try:
+            new_szi = abs(float(szi_raw))
+        except (TypeError, ValueError):
+            logging.debug("[INC] 无有效 szi（got=%s），跳过本条消息", szi_raw)
+            return
+        if new_szi == 0:
+            return
+        # 更新最近一次观测 szi
+        prev_szi = self._last_szi.get(coin)
+        inst_id = self._get_inst_id(coin)
+        if not inst_id:
+            # 诊断：记录 miss/filter/ttl（只日志，不改业务）
+            logging.info("[LP][SKIP] no-instId coin=%s filtered=%s miss_cache=%s",
+                         coin, self._is_filtered_coin(coin), self._skip_miss_coin(coin))
+            return
+  
+        # 更新本合约的 ATR%（如 MQ 带 vol.atr_pct）
+        try:
+            if isinstance(evt.get("vol"), dict) and "atr_pct" in evt["vol"]:
+                self._vol_cache[inst_id] = {"atr_pct": float(evt["vol"]["atr_pct"]), "ts": time.time()}
+        except Exception:
+            pass
+        # 当前已持仓（按方向聚合）
+        curr = 0.0
+        expect_pos_side = "long" if side.upper() == "LONG" else "short"
+        for pos in positions:
+            if pos.get("instId") != inst_id:
+                continue
+            if self.pos_mode == "long_short":
+                if pos.get("posSide", "").lower() != expect_pos_side:
+                    continue
+            qty = float(pos.get("pos", 0) or 0)
+            curr += abs(qty)
+        # ---------- Ⅰ-A. 获取最新价 & 合约规格 ---------- #
+        last_px = self._fresh_evt_px(evt) or self._safe_last_price(inst_id)
+        if last_px is None:
+            logging.warning("[TICKER][EMPTY] inst=%s，跳过本次 INC", inst_id)
+            return
+        # 计算加仓限价：entryPx/lastPx 二择其一作基准，并按方向加滑点
+        entry = float((evt.get("snapshot", {}) or {}).get("entryPx") or 0)
+        if side == "LONG":
+            base_px = entry if (entry > 0 and entry < last_px) else last_px
+        else:
+            base_px = entry if (entry > 0 and entry > last_px) else last_px
+        order_px = self._with_slip_for_side("long" if side == "LONG" else "short", base_px)
+        # 入场价保护：急跌/急涨下对加仓限价做保护性调整
+        try:
+            baseline_before_ep = float(order_px)
+            s = abs(float(self.ENTRY_SLIP or 0.0))
+            order_px = self._protected_entry_price(
+                inst_id=inst_id,
+                side_flag=side,                     # "LONG" / "SHORT"
+                baseline_px=baseline_before_ep,
+                last_px=float(last_px),
+                slip=s,
+            )
+            logging.debug("[EP][INC] inst=%s side=%s baseline=%.8f → protected=%.8f (last=%.8f, slip=%.5f)",
+                          inst_id, side, baseline_before_ep, float(order_px), float(last_px), s)
+        except Exception as _e:
+            logging.debug("[EP][INC][SKIP] %s", _e)
+        max_lev, ct_val, ct_ccy, min_sz = self._get_inst_spec(inst_id)
+
+        mq_lev_raw = (evt.get("lev") or evt.get("leverage")
+                      or evt.get("snapshot", {}).get("lev")
+                      or evt.get("snapshot", {}).get("leverage"))
+        mq_lev = int(float(mq_lev_raw)) if mq_lev_raw else None
+
+        # 把同向未成交挂单也计入，避免重复加仓
+        pending_same = 0.0
+        expected_side = "buy" if side.upper() == "LONG" else "sell"
+        for od in self.get_pending_orders():
+            if od.get("instId") != inst_id:
+                continue
+            if od.get("side", "").lower() != expected_side:
+                continue
+            if self.pos_mode == "long_short":
+                expect_pos_side = "long" if side.upper() == "LONG" else "short"
+                if od.get("posSide", "").lower() != expect_pos_side:
+                    continue
+            unfilled = float(od.get("sz", 0)) - float(od.get("accFillSz", 0) or 0)
+            pending_same += max(unfilled, 0)
+        curr_total = curr + pending_same
+        # —— 新增保护：仅有同向未成交挂单而没有任何已成交持仓时，跳过加仓 —— #
+        if curr == 0 and pending_same > 0:
+            logging.info("[INC][SKIP][PENDING_ONLY] inst=%s side=%s has only pending same-side orders (%.8f), no filled position; skip adding",
+                         inst_id, expect_pos_side, pending_same)
+            # 仍然更新主钱包规模观测，避免后续比例计算异常
+            self._last_szi[coin] = new_szi
+            return
+        # ── 保护策略 B：仅当本地已有同向暴露（持仓或同向挂单）时才处理 INC ──
+        # 解决“重启后第一条就是 INC 导致直接开仓”的问题
+        if curr_total <= 0:
+            logging.info("[INC][SKIP][B] no local exposure yet; ignore INC until OPEN or local pos/pending exists")
+            # 仍然更新主钱包最新规模观测，后续比率计算不至于异常
+            self._last_szi[coin] = new_szi
+            return
+
+        # ------- 按比例放大（对称于 DEC 的比例缩减） -------
+        # prev_szi/new_szi 基于 MQ 的主钱包规模
+        if prev_szi and prev_szi > 0 and new_szi > prev_szi:
+            r = new_szi / prev_szi
+            target_local   = curr_total * r
+            diff_contracts = target_local - curr_total
+            logging.info("[INC] 比例放大 r=%.6f | curr_total=%.4f → target_local=%.4f → diff=%.4f",
+                         r, curr_total, target_local, diff_contracts)
+        else:
+            # 回退：用主钱包“绝对 szi”换算的目标张数
+            target_contracts = self._coin_to_contracts(new_szi, ct_val, ct_ccy, last_px)
+            diff_contracts   = target_contracts - curr_total
+            logging.info("[INC] 绝对目标 | curr_total=%.4f target_contracts=%.4f → diff=%.4f",
+                         curr_total, target_contracts, diff_contracts)
+
+        if diff_contracts <= 0:
+            logging.info("[INC] 无需加仓：curr_total=%.4f，prev=%.4f → new=%.4f",
+                         curr_total, prev_szi or -1.0, new_szi)
+            self._last_szi[coin] = new_szi
+            return
+
+        # --- Ⅱ. 可支配余额 & 安全垫 --- #
+        avail_usdt   = self._get_available_usdt()
+        reserve_usdt = max(self.RESERVE_MIN_USDT,
+                           avail_usdt * self.RESERVE_RATIO)
+        tradeable    = max(0, avail_usdt - reserve_usdt)
+        if tradeable == 0:
+            logging.info("INC but no tradeable USDT (avail=%.4f)", avail_usdt)
+            return
+
+        # --- Ⅲ. 重建 master 钱包权重 --- #
+        entry = float(evt.get("snapshot", {}).get("entryPx", 0) or 0)
+        if entry == 0:
+            logging.info("INC 缺少 entryPx，跳过")
+            return
+        self._wallet_value[coin] = new_szi * entry      # 更新该币价值
+        total_value = sum(self._wallet_value.values())
+        if total_value == 0:
+            logging.info("wallet total value = 0，跳过")
+            return
+        proportion  = self._wallet_value[coin] / total_value
+
+        # ---------- 余额 / 预算控制 ---------- #
+        budget_usdt = tradeable * self.BUDGET_RATIO * proportion
+        # 波动率配比缩放（与 OPEN 保持一致）
+        budget_usdt *= self._budget_scale_by_vol(inst_id)
+
+        # ---------- 最新价格 & 合约规格 ---------- #
+
+        notional = ct_val if ct_ccy.upper() == "USDT" else ct_val * last_px
+        lev = self._select_leverage(max_lev, mq_lev)
+
+        # === 新：imr 走 TTL 缓存（常态不查 HTTP） ===
+        eff_imr = self._get_imr_fast(inst_id, lev)
+
+        # 预算能买几张；把比例缺口夹在预算上限内
+        max_by_budget = int(budget_usdt / (notional * eff_imr))
+        contracts     = int(math.ceil(diff_contracts))
+        if max_by_budget > 0:
+            contracts = min(contracts, max_by_budget)
+        # --- 保证金再次校验，不行就递减 ---
+        tradeable = max(0, avail_usdt - reserve_usdt)
+        while contracts > 0:
+            need_margin = contracts * notional * eff_imr
+            if need_margin <= tradeable:
+                break
+            contracts -= 1
+        if contracts == 0:
+            logging.info("保证金不足，INC 放弃")
+            return
+
+        if contracts < min_sz:                               # 不足最小下单量 → 选抬到 min_sz
+            contracts = math.ceil(min_sz)
+
+
+        diff_contracts = contracts
+        side_param = "buy" if side == "LONG" else "sell"
+
+        logging.info("[INC] %s size %.8f → +%.8f (%s)  | budget=%.4f  proportion=%.4f",
+                     inst_id, curr, diff_contracts, side_param, budget_usdt, proportion)
+        if mode == "test":
+            logging.info("[TEST] Would add_position inst=%s px=%.8f size=%.8f side=%s",
+                         inst_id, order_px, diff_contracts, side_param)
+        else:
+            resp = self.add_position(
+                inst_id, order_px, diff_contracts, side_param,
+                mq_lev=mq_lev)
+            logging.info("[INC] add_position resp=%s", resp)
+        # 更新观测
+        self._last_szi[coin] = new_szi
+    # ============================================================
+    #  SIZE-DEC → 减仓
+    # ============================================================
+    def _handle_size_dec(self, evt: dict):
+        coin   = evt.get("coin", "").upper()
+        side   = evt.get("side", "-").upper()          # LONG / SHORT  —— 先前方向
+        positions = self.get_positions()  # 单次复用
+        # MQ 里偶尔 snapshot.szi 为 None/""，需做健壮处理
+        szi_raw = evt.get("snapshot", {}).get("szi")
+        try:
+            new_szi = abs(float(szi_raw))
+        except (TypeError, ValueError):
+            logging.debug("[DEC] 无有效 szi（got=%s），跳过", szi_raw)
+            return
+        # 旧值用于比例缩放
+        prev_szi = self._last_szi.get(coin)
+        inst_id = self._get_inst_id(coin)
+        if not inst_id:
+            return
+
+        # 当前已持仓（按方向聚合）
+        curr = 0.0
+        expect_pos_side = "long" if side.upper() == "LONG" else "short"
+        for pos in positions:
+            if pos.get("instId") != inst_id:
+                continue
+            if self.pos_mode == "long_short":
+                if pos.get("posSide", "").lower() != expect_pos_side:
+                    continue
+            qty = float(pos.get("pos", 0) or 0)
+            curr += abs(qty)
+
+        # ---------- 获取最新价 & 合约规格 ---------- #
+        last_px = self._fresh_evt_px(evt) or self._safe_last_price(inst_id)
+        if last_px is None:
+            logging.warning("[TICKER][EMPTY] inst=%s，跳过本次 DEC", inst_id)
+            return
+        max_lev, ct_val, ct_ccy, min_sz = self._get_inst_spec(inst_id)
+        # --- Ⅰ-A. 把同向「未成交委托」也算进来 -------------------- #
+        pending_same = 0.0
+        expected_side = "buy" if side == "LONG" else "sell"
+        for od in self.get_pending_orders():
+            if od.get("instId") != inst_id:
+                continue
+            if od.get("side", "").lower() != expected_side:
+                continue
+            # long_short 模式需进一步比对 posSide
+            if self.pos_mode == "long_short":
+                expect_pos_side = "long" if side == "LONG" else "short"
+                if od.get("posSide", "").lower() != expect_pos_side:
+                    continue
+            # 未成交张数 = 总量 - 已成交
+            unfilled = float(od.get("sz", 0)) - float(od.get("accFillSz", 0) or 0)
+            pending_same += max(unfilled, 0)
+
+        curr_total = curr + pending_same
+        # ★ 新增：当主钱包减到 0 时，撤掉该方向的挂单（避免仅剩挂单继续开仓）
+        if new_szi == 0:
+            try:
+                # 仅撤当前方向挂单；若希望更保守，可去掉第二个参数撤所有方向
+                self._cancel_all_pending(inst_id, expect_pos_side)
+            except Exception as e:
+                logging.warning("[DEC→0][CANCEL][FAIL] inst=%s err=%s", inst_id, e)
+        # --- Ⅰ-B. 目标（按比例） ---
+        # 若已观测到 prev_szi，则按比例跟随；否则回退到“绝对 szi”方案
+        if prev_szi and prev_szi > 0 and new_szi < prev_szi:
+            r = new_szi / prev_szi
+            target_local = curr_total * r
+            diff_contracts = curr_total - target_local
+            logging.info("[DEC] 比例缩减 r=%.6f | curr_total=%.4f → target_local=%.4f → diff=%.4f",
+                         r, curr_total, target_local, diff_contracts)
+        else:
+            target_contracts = self._coin_to_contracts(new_szi, ct_val, ct_ccy, last_px)
+            diff_contracts   = curr_total - target_contracts
+            logging.info("[DEC] 绝对目标 | curr_total=%.4f target_contracts=%.4f → diff=%.4f",
+                         curr_total, target_contracts, diff_contracts)
+        if diff_contracts <= 0:
+            logging.info("[DEC] 无需减仓：curr_total=%.4f，prev=%.4f → new=%.4f",
+                         curr_total, prev_szi or -1.0, new_szi)
+            # 更新观测
+            self._last_szi[coin] = new_szi
+            return
+
+        # ---------- 将 diff 规范成合法张数 ---------- #
+        max_lev, ct_val, ct_ccy, min_sz = self._get_inst_spec(inst_id)
+        last_px = self._safe_last_price(inst_id) or last_px
+
+        # 需要减少的“总暴露”（含同向挂单）
+        need = int(math.ceil(diff_contracts))
+        if need < min_sz:
+            need = math.ceil(min_sz)
+        side_param = "buy" if side == "LONG" else "sell"
+
+        # ① 先减掉已持仓（最多不超过 curr）
+        cut_pos = min(need, int(math.ceil(curr)))
+        if cut_pos > 0:
+            logging.info("[DEC] reduce position first: %s → cut_pos=%s", inst_id, cut_pos)
+            if mode == "test":
+                logging.info("[TEST] Would reduce_position inst=%s size=%s side=%s",
+                             inst_id, cut_pos, side_param)
+            else:
+                self.reduce_position(inst_id, last_px, cut_pos, side_param)
+            need -= cut_pos
+
+        # ② 若仍需减少，则处理同向未成交挂单（撤单以降低剩余暴露）
+        if need > 0:
+            logging.info("[DEC] still need to shave pending: need=%s", need)
+            for od in self.get_pending_orders():
+                if need <= 0:
+                    break
+                if od.get("instId") != inst_id:
+                    continue
+                if od.get("side", "").lower() != ("buy" if side.upper()=="LONG" else "sell"):
+                    continue
+                if self.pos_mode == "long_short":
+                    if od.get("posSide", "").lower() != expect_pos_side:
+                        continue
+                total_sz = float(od.get("sz", 0) or 0)
+                filled   = float(od.get("accFillSz", 0) or 0)
+                unfilled = max(0.0, total_sz - filled)
+                if unfilled <= 0:
+                    continue
+                logging.info("[DEC] cancel pending order to shave: ordId=%s unfilled=%.8f",
+                             od.get("ordId"), unfilled)
+                if mode == "test":
+                    logging.info("[TEST] Would cancel_order inst=%s ordId=%s",
+                                 inst_id, od.get("ordId"))
+                else:
+                    try:
+                        self._call_api(self.trade_api.cancel_order,
+                                       instId=inst_id, ordId=od["ordId"])
+                    except Exception as e:
+                        logging.warning("cancel_order failed: %s", e)
+                need -= int(math.ceil(unfilled))
+
+        logging.info("[DEC] done: cut_pos=%s, shaved_pending=%s, remaining_need=%s",
+                     (min(int(math.ceil(diff_contracts)), int(math.ceil(curr)))),
+                     max(0, int(math.ceil(diff_contracts)) - int(math.ceil(curr)) - max(0, need)),
+                     max(0, need))
+        # 更新观测
+        self._last_szi[coin] = new_szi
+    # ============================================================
+    #  SIZE-REVERSE → 反手
+    # ============================================================
+    def _handle_size_reverse(self, evt: dict):
+        coin   = evt.get("coin", "").upper()
+        side   = evt.get("side", "-").upper()          # 反手后的新方向
+        # 钱包 szi 是“币数量” → 先记下来，后面统一换算成“张”
+        target_coin = abs(float(evt.get("snapshot", {}).get("szi", 0)))
+        positions = self.get_positions()  # 单次复用
+        inst_id = self._get_inst_id(coin)
+        if not inst_id:
+            return
+
+        # 1) 先把现有仓位全部平掉
+        for pos in positions:
+            if pos.get("instId") != inst_id:
+                continue
+            curr_sz = abs(float(pos.get("pos", 0)))
+            if curr_sz == 0:
+                continue
+
+            last_px = float(self._safe_last_price(inst_id) or 0)
+            # reduce_position 需要传“原方向”，方法内部会自动下相反方向单
+            orig_side = "buy" if float(pos.get("pos", 0)) > 0 else "sell"
+            pos_side_now = "long" if orig_side == "buy" else "short"
+            px_red = float(last_px)
+            if mode == "test":
+                logging.info("[TEST] Would reduce_position inst=%s size=%.8f side=%s", inst_id, curr_sz, orig_side)
+            else:
+                self.reduce_position(inst_id, px_red, curr_sz, orig_side)
+
+        if target_coin == 0:
+            return
+
+        # 2) 再按新方向开仓 target size
+        # 优先事件里的热价格，再回退到缓存/REST
+        last_px = self._fresh_evt_px(evt) or self._safe_last_price(inst_id)
+        if last_px is None:
+            logging.warning("[TICKER][EMPTY] inst=%s，跳过本次 REVERSE", inst_id)
+            return
+        last_px = float(last_px)
+        max_lev, ct_val, ct_ccy, min_sz = self._get_inst_spec(inst_id)
+        target_contracts                = self._coin_to_contracts(
+                                            target_coin, ct_val, ct_ccy, last_px)
+        if target_contracts < min_sz:
+            target_contracts = math.ceil(min_sz)
+        side_param = "buy" if side == "LONG" else "sell"
+        # 以 entryPx/lastPx 选基准价并按方向加滑点
+        entry = float((evt.get("snapshot", {}) or {}).get("entryPx") or 0)
+        if side == "LONG":
+            base_px = entry if (entry > 0 and entry < last_px) else last_px
+        else:
+            base_px = entry if (entry > 0 and entry > last_px) else last_px
+        # 反转开仓不加滑点
+        order_px = float(base_px)
+        # 入场价保护：反手同样应用保护（反手不加滑点 → slip=0）
+        try:
+            baseline_before_ep = float(order_px)
+            order_px = self._protected_entry_price(
+                inst_id=inst_id,
+                side_flag=side,                     # "LONG" / "SHORT"
+                baseline_px=baseline_before_ep,
+                last_px=float(last_px),
+                slip=0.0,
+            )
+            logging.debug("[EP][REVERSE] inst=%s side=%s baseline=%.8f → protected=%.8f (last=%.8f)",
+                          inst_id, side, baseline_before_ep, float(order_px), float(last_px))
+        except Exception as _e:
+            logging.debug("[EP][REVERSE][SKIP] %s", _e)
+
+    # ============================================================
+    #  FILL-CLOSE → 全平
+    # ============================================================
+    def _handle_fill_close(self, evt: dict):
+        coin = evt.get("coin", "").upper()
+        inst_id = self._get_inst_id(coin)
+        if not inst_id:
+            return
+        positions = self.get_positions()  # 单次复用
+        # ★ 新增：平仓消息到来时，先撤掉该交易对全部未成交挂单（避免已平仓但挂单仍在）
+        try:
+            self._cancel_all_pending(inst_id)
+        except Exception as e:
+            logging.warning("[CLOSE][CANCEL][FAIL] inst=%s err=%s", inst_id, e)
+        # 清理主钱包规模观测，避免用旧 szi 做比例跟随
+        self._last_szi.pop(coin, None)
+        # 清理 VP 级别与触发计数
+        self._vp_levels.pop(f"{inst_id}:long",  None); self._vp_levels.pop(f"{inst_id}:short", None)
+        self._node_tp_hits.pop(f"{inst_id}:long", None); self._node_tp_hits.pop(f"{inst_id}:short", None)
+        self._node_sl_hits.pop(f"{inst_id}:long", None); self._node_sl_hits.pop(f"{inst_id}:short", None)
+
+        # 清掉两个方向的阶梯记录（全平）
+        self._pp_hits.pop(self._pp_key(inst_id, "long"),  None)
+        self._pp_hits.pop(self._pp_key(inst_id, "short"), None)
+        self._save_profit_guard_state()
+        self._lp_hits.pop(self._pp_key(inst_id, "long"),  None)
+        self._lp_hits.pop(self._pp_key(inst_id, "short"), None)
+        self._save_loss_guard_state()
+        # 平仓也清理“价格去重”点
+        self._pp_last_px.pop(self._pp_key(inst_id, "long"),  None); self._pp_last_px.pop(self._pp_key(inst_id, "short"), None)
+        self._lp_last_px.pop(self._pp_key(inst_id, "long"),  None); self._lp_last_px.pop(self._pp_key(inst_id, "short"), None)
+        self._save_profit_guard_px_state(); 
+        self._save_loss_guard_px_state()
+        # 清理 MFE/滞回/冷却
+        for k in (f"{inst_id}:long", f"{inst_id}:short"):
+            self._mfe_peak.pop(k, None)
+            self._mfe_hits.pop(k, None)
+            self._hys_state_pp.pop(k, None); self._hys_state_lp.pop(k, None)
+            self._cooldown_ts.pop(k, None)
+            # 同时清理 MFE A+B 的状态
+            self._mfe_last_roe.pop(k, None)
+            self._mfe_gated.pop(k, None)
+            self._mfe_last_peak_trig.pop(k, None)
+        for pos in positions:
+            if pos.get("instId") != inst_id:
+                continue
+            curr = float(pos.get("pos", 0))
+            if curr == 0:
+                return
+
+            last_px = float(self._call_api(self.market_api.get_ticker, instId=inst_id)["data"][0]["last"])
+            # 原仓方向：curr>0 代表 long，否则 short
+            orig_side = "buy" if curr > 0 else "sell"      # 交给 reduce_position 判定
+            if mode == "test":
+                logging.info("[TEST] Would reduce full position inst=%s size=%.8f side=%s", inst_id, abs(curr), orig_side)
+            else:
+                self.reduce_position(inst_id, last_px, abs(curr), orig_side)
+            break
+
+    # ============================================================
+    #  INFO → 风控（最大回撤/分档止损/收益保护）
+    # ============================================================
+    def _handle_info(self, evt: dict):
+        """按 ROE 百分比执行：最大回撤硬止损、LP 分档止损，以及 PP 收益保护。"""
+        positions = self.get_positions()  # 单次复用
+        coin   = evt.get("coin", "").upper()
+        # RabbitMQ INFO 消息中常见字段：midPx / last / px
+        mid_px = evt.get("midPx") or evt.get("last") or evt.get("px")
+        if not (coin and mid_px):
+            return
+        try:
+            mid_px = float(mid_px)
+            if mid_px <= 0:
+                return
+        except Exception:
+            return
+
+        inst_id = self._get_inst_id(coin)
+        if not inst_id:
+            return
+        # 合并特征（ATR% / 多时段 VP / 邻近 HVN/LVN）
+        with suppress(Exception): self._update_px_cache(inst_id, last=mid_px, ts=evt.get("ts"))
+        try:
+            self._merge_feat_into_event(inst_id, evt)
+        except Exception: pass
+        # 更新 vol.atr_pct（来自 MQ）
+        try:
+            if isinstance(evt.get("vol"), dict) and "atr_pct" in evt["vol"]:
+                self._vol_cache[inst_id] = {"atr_pct": float(evt["vol"]["atr_pct"]), "ts": time.time()}
+        except Exception:
+            pass
+        # 预先统一计算一次方向，供后续分支复用
+        side_flag = (evt.get("side") or "-").upper()
+        pos_side  = "long" if side_flag == "LONG" else ("short" if side_flag == "SHORT" else None)
+
+        # ===================== ① 最大回撤（ROE% 硬止损） ===================== #
+        # 是否处于监控中：未监控则关闭 VP/HVN/LVN，只保留 ATR 动态 P/L
+        monitored = self._is_monitored(inst_id=inst_id, coin=coin)
+        if self.MAX_DD_ROE_PCT > 0:
+            for pos in positions:             # 逐持仓检查
+                if pos.get("instId") != inst_id:
+                    continue
+                qty      = float(pos.get("pos", 0) or 0)
+                entry_px = float(pos.get("avgPx", 0) or 0)
+                if qty == 0 or entry_px == 0:
+                    logging.info("[MAX_DD][ROE][SKIP] inst=%s qty=%.8f entry=%.8f", inst_id, qty, entry_px)
+                    continue
+
+                is_long = qty > 0
+                # 杠杆估计：优先 position.lever，其次 evt/snapshot，兜底 1
+                lev_est = (pos.get("lever") or pos.get("lev")
+                           or evt.get("lev") or evt.get("leverage")
+                           or (evt.get("snapshot", {}) or {}).get("lev")
+                           or (evt.get("snapshot", {}) or {}).get("leverage") or 1)
+                try:
+                    lev_est = float(lev_est);  lev_est = 1.0 if lev_est <= 0 else lev_est
+                except Exception:
+                    lev_est = 1.0
+                raw     = (mid_px - entry_px) / entry_px
+                roe_pct = (raw * 100.0 * lev_est) if is_long else (-raw * 100.0 * lev_est)
+                loss_pct = max(0.0, -roe_pct)   # 亏损用正数表示
+
+                if loss_pct < self.MAX_DD_ROE_PCT:
+                    logging.debug("[MAX_DD][ROE][SKIP] inst=%s side=%s loss=%.2f%% < thr=%.2f%%",
+                                  inst_id, ("LONG" if is_long else "SHORT"), loss_pct, self.MAX_DD_ROE_PCT)
+                    continue
+
+                side_param = "buy" if is_long else "sell"   # reduce_position 原向
+                px = mid_px * (1 - self.ENTRY_SLIP) if is_long else mid_px * (1 + self.ENTRY_SLIP)
+                logging.warning("[MAX_DD][ROE] %s %s loss=%.2f%% ≥ %.2f%% — 强制平仓 %.8f 张 @ %.4f (lev~%s)",
+                                coin, "LONG" if is_long else "SHORT",
+                                loss_pct, self.MAX_DD_ROE_PCT, abs(qty), px, lev_est)
+                if mode == "test":
+                    logging.info("[TEST] Would reduce_position inst=%s size=%.8f side=%s px=%.8f",
+                                 inst_id, abs(qty), side_param, px)
+                else:
+                    self.reduce_position(inst_id, px, abs(qty), side_param)
+        
+
+
+        # ===================== ② 止损保护（ATR 分档；仅未监控时启用） ===================== #
+        # 设计：已监控 → 由 VP/LVN 负责亏损保护；未监控 → 才使用 ATR/固定档位分档
+        logging.debug("[LP][CHECK] monitored=%s coin=%s inst=%s midPx=%.8f",
+                      monitored, coin, inst_id, float(mid_px))
+        if (not monitored) and self.LP_STEP_PCT > 0 and self.LP_CUT_RATIO > 0:
+            for pos in positions:     
+                if pos.get("instId") != inst_id:
+                    continue
+                qty      = float(pos.get("pos", 0) or 0)
+                entry_px = float(pos.get("avgPx", 0) or 0)
+                if qty == 0 or entry_px == 0:
+                    logging.info("[LP][ROE][SKIP] inst=%s 无有效仓位/均价 qty=%.8f entry=%.8f", inst_id, qty, entry_px)
+                    continue
+                is_long  = qty > 0
+                # 估计杠杆：优先 position.lever，其次 evt/snapshot，兜底 1
+                lev_est = (pos.get("lever") or pos.get("lev")
+                           or evt.get("lev") or evt.get("leverage")
+                           or (evt.get("snapshot", {}) or {}).get("lev")
+                           or (evt.get("snapshot", {}) or {}).get("leverage") or 1)
+                try:
+                    lev_est = float(lev_est);  lev_est = 1.0 if lev_est <= 0 else lev_est
+                except Exception:
+                    lev_est = 1.0
+                raw      = (mid_px - entry_px) / entry_px
+                roe_pct  = (raw * 100.0 * lev_est) if is_long else (-raw * 100.0 * lev_est)
+                loss_pct = max(0.0, -roe_pct)      # 亏损幅度（%）
+                if loss_pct <= 0:
+                    logging.info("[LP][ROE][SKIP] non-loss inst=%s side=%s roe=%.2f%% entry=%.6f mid=%.6f",
+                                 inst_id, ("LONG" if is_long else "SHORT"), roe_pct, entry_px, mid_px)
+                    continue
+                pos_side   = "long" if is_long else "short"
+                key        = self._pp_key(inst_id, pos_side)
+                last_hit   = int(self._lp_hits.get(key, 0))
+                need_lvl   = last_hit + 1
+
+                # —— 阈值：优先 ATR × 杠杆动态阶梯；无 ATR 则回退固定阶梯 —— #
+                dyn_thr = self._lp_step_threshold(lev_est, need_lvl, inst_id)
+                if dyn_thr is not None and dyn_thr > 0:
+                    thr_hi = dyn_thr * (1 - self.LP_TOLERANCE_PCT/100.0)
+                else:
+                    thr_hi = self.LP_STEP_PCT * need_lvl * (1 - self.LP_TOLERANCE_PCT/100.0)
+                # 滞回：低阈=基于“本级实际高阈”的带宽
+                hys_lo = thr_hi * (1 - self.HYS_BAND_PCT/100.0)
+                # 滞回开关与冷却
+                hys_key = f"{key}:LP"
+                state = self._hys_state_lp.get(hys_key, "armed")
+                if state != "armed":
+                    if loss_pct <= max(0.0, hys_lo):
+                        self._hys_state_lp[hys_key] = "armed"
+                    logging.debug("[LP][HYS] disarmed (loss=%.2f%%, rearm<=%.2f%%)", loss_pct, hys_lo)
+                    continue
+                if loss_pct < thr_hi or self._under_cooldown(f"{hys_key}:lvl{need_lvl}"):
+ 
+                    logging.info("[LP][ROE][SKIP] below-threshold inst=%s side=%s lossROE=%.2f%% threshold=%.2f%% lvl=%d",
+                                 inst_id, pos_side.upper(), loss_pct, thr_hi, need_lvl)
+                    continue
+                # —— 价格点去重：同一档在同一价格附近不重复触发 ——
+                key = self._pp_key(inst_id, pos_side)
+                last_px_trig = self._lp_last_px.get(key)
+                # 价格去重容差：max(固定配置, k_atr×ATR%)
+                tol_pct = (self._px_tol_pct(inst_id) or float(self.TRIGGER_PX_TOL_PCT or 0.0)) * self._lvl_factor(need_lvl)
+                tol = abs(mid_px) * (tol_pct/100.0)
+                if last_px_trig is not None and abs(float(mid_px) - float(last_px_trig)) <= tol:
+                    logging.info("[LP][SKIP] px-dedup inst=%s side=%s mid=%.8f last=%.8f tol=%.8f",
+                                 inst_id, pos_side.upper(), float(mid_px), float(last_px_trig), tol)
+                    continue
+                # 记录触发价（先记，避免并发重复）
+                self._lp_last_px[key] = mid_px
+                self._save_loss_guard_px_state()
+                # 计算减仓张数（≥ minSz，≤ 当前张数）
+                _, _, _, min_sz = self._get_inst_spec(inst_id)
+                curr = abs(qty)
+                # 优化 2：LP 递进比例
+                cut_ratio = float(self.LP_CUTS[min(len(self.LP_CUTS)-1, max(0, need_lvl-1))]) if self.LP_CUTS else self.LP_CUT_RATIO
+                base_cut = int(math.ceil(curr * cut_ratio))
+                min_cut  = int(math.ceil(min_sz))
+                cut_contracts = max(min_cut, base_cut)
+                cut_contracts = min(cut_contracts, int(math.ceil(curr)))
+                if cut_contracts <= 0:
+                    logging.info("[LP][SKIP] cut<=0 inst=%s curr=%.8f minSz=%.8f cut_ratio=%.2f%% base_cut=%d",
+                                 inst_id, curr, min_sz, self.LP_CUT_RATIO*100, base_cut)
+                    continue
+                side_param = "buy" if pos_side == "long" else "sell"
+                px = mid_px
+                # 冷却 + 滞回出栈
+                self._hys_state_lp[hys_key] = "disarmed"; self._mark_cooldown(f"{hys_key}:lvl{need_lvl}")
+ 
+                logging.warning("[LP][ROE] %s %s lossROE=%.2f%% 达到第 %d 档(上次=%d) → 减仓 %s 张 (lev~%s)",
+                                inst_id, pos_side.upper(), loss_pct, need_lvl, last_hit, cut_contracts, lev_est)
+                logging.info("[LP][CUT] inst=%s side=%s curr=%.6f minSz=%.6f cut_ratio=%.2f%% -> cut=%s px=%.8f",
+                             inst_id, pos_side.upper(), curr, min_sz, self.LP_CUT_RATIO*100,
+                             cut_contracts, px)
+                if mode == "test":
+                    logging.info("[TEST][LP] Would reduce_position inst=%s size=%s side=%s px=%.8f",
+                                 inst_id, cut_contracts, side_param, px)
+                else:
+                   self.reduce_position(inst_id, px, cut_contracts, side_param)
+
+                # 记录触发层级（持久化）
+                self._lp_hits[key] = need_lvl
+                self._save_loss_guard_state()
+
+        # ===================== ③ 收益保护（ATR 分档；仅未监控时启用） ===================== #
+        # 设计：已监控 → 由 VP/HVN 负责盈利保护；未监控 → 才使用 ATR/固定档位分档
+        if (not monitored) and self.PP_STEP_PCT > 0 and self.PP_CUT_RATIO > 0:
+            snap = evt.get("snapshot", {}) or {}
+            roe_pct = None
+            try:
+                unreal = snap.get("unrealizedPnl")
+                margin = snap.get("marginUsed")
+                if unreal is not None and margin not in (None, "", 0, "0"):
+                    roe_pct = 100.0 * float(unreal) / max(1e-12, float(margin))
+                else:
+                    roe_val = snap.get("returnOnEquity")
+                    if roe_val is not None:
+                        r = float(roe_val)
+                        # 常见：0.8 表示 80% ；也可能直接给 80
+                        roe_pct = r * 100.0 if abs(r) <= 10 else r
+            except Exception:
+                roe_pct = None
+
+            # —— 兜底：用 midPx / entryPx / side / lev 估算 ROE ——
+            if roe_pct is None:
+                try:
+                    entry_px = float(snap.get("entryPx") or 0)
+                    lev_est  = snap.get("lev") or snap.get("leverage") or evt.get("lev")
+                    lev_est  = float(lev_est) if lev_est is not None else 1.0
+                    side_f   = (evt.get("side") or "-").upper()
+                    if entry_px > 0 and mid_px > 0 and side_f in ("LONG", "SHORT"):
+                        raw = (mid_px - entry_px) / entry_px
+                        roe_pct = raw * 100.0 * (lev_est if side_f == "LONG" else -lev_est)
+                except Exception:
+                    roe_pct = None
+
+            if roe_pct is None or roe_pct <= 0:
+                return
+
+            side_flag = (evt.get("side") or "-").upper()   # "LONG"/"SHORT"
+            pos_side  = "long" if side_flag == "LONG" else ("short" if side_flag == "SHORT" else None)
+            if not pos_side:
+                return
+
+            key       = self._pp_key(inst_id, pos_side)
+            last_hit  = int(self._pp_hits.get(key, 0))
+            need_lvl  = last_hit + 1
+      
+            # 目标阈值：优先 ATR×杠杆的动态阶梯；无则回退固定阶梯（thr_hi）
+            try:
+                lev_est = (evt.get("lev") or (evt.get("snapshot", {}) or {}).get("lev") or 1)
+                dyn_thr = self._pp_step_threshold(float(lev_est or 1), need_lvl, inst_id)
+            except Exception:
+                dyn_thr = None
+            if dyn_thr is not None and dyn_thr > 0:
+                thr_hi = dyn_thr * (1 - self.PP_TOLERANCE_PCT/100.0)
+            else:
+                thr_hi = self.PP_STEP_PCT * need_lvl * (1 - self.PP_TOLERANCE_PCT/100.0)
+            # 滞回 + 冷却（低阈跟随 thr_hi）
+            hys_key = f"{key}:PP"
+            hys_lo  = thr_hi * (1 - self.HYS_BAND_PCT/100.0)
+            state   = self._hys_state_pp.get(hys_key, "armed")
+            if state != "armed":
+                if roe_pct <= max(0.0, hys_lo):
+                    self._hys_state_pp[hys_key] = "armed"
+                logging.debug("[PP][HYS] disarmed (roe=%.2f%%, rearm<=%.2f%%)", roe_pct, hys_lo)
+                return
+            if roe_pct < thr_hi or self._under_cooldown(f"{hys_key}:lvl{need_lvl}"):
+                return
+            # —— 价格点去重：同一档在同一价格附近不重复触发 ——
+            last_px_trig = self._pp_last_px.get(key)
+            tol_pct = (self._px_tol_pct(inst_id) or float(self.TRIGGER_PX_TOL_PCT or 0.0)) * self._lvl_factor(need_lvl)
+            tol = abs(mid_px) * (tol_pct/100.0)
+            if last_px_trig is not None and abs(mid_px - last_px_trig) <= tol:
+                return
+            # 记录触发价（先记，避免并发重复）
+            self._pp_last_px[key] = mid_px
+            self._save_profit_guard_px_state()
+            # 查询本地当前仓位（按方向）
+            curr = 0.0
+            for pos in positions:
+                if pos.get("instId") != inst_id:
+                    continue
+                if self.pos_mode == "long_short" and pos.get("posSide", "").lower() != pos_side:
+                    continue
+                curr = abs(float(pos.get("pos", 0) or 0))
+                break
+            if curr <= 0:
+                # 没有对应方向的本地仓位，不做处理，但仍记层级，防止高频反复触发
+                self._pp_hits[key] = need_lvl
+                self._save_profit_guard_state()
+                return
+            # 计算减仓张数并执行（保持在 PP 分支内）
+            _, _, _, min_sz = self._get_inst_spec(inst_id)
+            # 优化 2：PP 递进比例
+            cut_ratio = float(self.PP_CUTS[min(len(self.PP_CUTS)-1, max(0, need_lvl-1))]) if self.PP_CUTS else self.PP_CUT_RATIO
+            cut_contracts = max(int(math.ceil(min_sz)), int(math.ceil(curr * cut_ratio)))
+            side_param = "buy" if pos_side == "long" else "sell"
+            px = mid_px * (1 - self.ENTRY_SLIP) if pos_side=="long" else mid_px * (1 + self.ENTRY_SLIP)
+            # 冷却 + 滞回出栈
+            self._hys_state_pp[hys_key] = "disarmed"
+            self._mark_cooldown(f"{hys_key}:lvl{need_lvl}")
+            logging.info("[PP] %s %s ROE=%.2f%% 达到第 %d 档(>%d) → 减仓 %.8f 张",
+                         inst_id, pos_side.upper(), roe_pct, need_lvl, last_hit, cut_contracts)
+            if mode == "test":
+                logging.info("[TEST][PP] Would reduce_position inst=%s size=%s side=%s px=%.8f",
+                             inst_id, cut_contracts, side_param, px)
+            else:
+                self.reduce_position(inst_id, px, cut_contracts, side_param)
+            # 记录触发层级（持久化）
+            self._pp_hits[key] = need_lvl
+            self._save_profit_guard_state()
+
+        # ===================== ⑤ 多时段 HVN/LVN 保护（仅已监控） ===================== #
+        if monitored and pos_side:
+            key = f"{inst_id}:{pos_side}"
+            lvl = self._vp_levels.get(key) or {}
+            # --- 若 INFO 或订阅缓存提供了多时段 VP（profile_multi）
+            #     则用 quick_eval_from_event 计算“满足 ≥30%ROE(含杠杆) 最小间距”的 HVN/LVN 节点序列，
+            #     并把 entry_adj 同步到本地，以做 ROE 与价差换算
+            #     则动态刷新节点序列，并补齐/回填 entry_adj（优先 quick_eval → snapshot.entryPx → 本地 avgPx）
+            try:
+                prof = evt.get("profile") or {}
+                has_multi = bool(evt.get("profile_multi") or prof.get("multi") or prof.get("volume_multi"))
+                if has_multi:
+                    # 估计杠杆（用于“≥30% ROE → 价差”的换算）
+                    lev_est = (evt.get("lev") or evt.get("leverage")
+                            or (evt.get("snapshot", {}) or {}).get("lev")
+                            or (evt.get("snapshot", {}) or {}).get("leverage") or 1)
+                    tmp = quick_eval_from_event(
+                        evt,
+                        leverage=float(lev_est or 1),
+                        min_roe_gap_pct=self.RG_MIN_ROE_GAP_PCT,
+                        node_min_roe_pct=self.RG_MIN_ROE_GAP_PCT,
+                    )
+
+                    nodes = (tmp.get("nodes") or {})
+                    ntp = list(map(float, nodes.get("tp_nodes", []) or []))
+                    nsl = list(map(float, nodes.get("sl_nodes", []) or []))
+                    if ntp:
+                        self._vp_levels.setdefault(key, {}).update({"tp_nodes": ntp})
+                        self._node_tp_hits[key] = min(self._node_tp_hits.get(key, 0), len(ntp))
+                    if nsl:
+                        self._vp_levels.setdefault(key, {}).update({"sl_nodes": nsl})
+                        self._node_sl_hits[key] = min(self._node_sl_hits.get(key, 0), len(nsl))
+                    # 同步 guards（profit_protect_ref / loss_protect_ref），用于 VA/ATR 回退
+                    if isinstance(tmp.get("guards"), dict) and tmp["guards"]:
+                        self._vp_levels.setdefault(key, {}).update({"guards": tmp["guards"]})
+                    # —— 新增：同步/回填 entry_adj —— #
+                    entry_adj_new = float(tmp.get("entry_adj") or 0.0)
+                    if entry_adj_new > 0:
+                        self._vp_levels.setdefault(key, {}).update({"entry_adj": entry_adj_new})
+                    elif not self._vp_levels.get(key, {}).get("entry_adj"):
+                        # 回退 1：snapshot.entryPx
+                        entry_px = float((evt.get("snapshot", {}) or {}).get("entryPx") or 0)
+                        if entry_px > 0:
+                            self._vp_levels.setdefault(key, {}).update({"entry_adj": entry_px})
+                        else:
+                            # 回退 2：本地持仓 avgPx（按方向筛选）
+                            for pos in positions:
+                                if pos.get("instId") != inst_id: 
+                                    continue
+                                if self.pos_mode == "long_short" and pos.get("posSide","").lower() != pos_side:
+                                    continue
+                                apx = float(pos.get("avgPx") or 0)
+                                if apx > 0:
+                                    self._vp_levels.setdefault(key, {}).update({"entry_adj": apx})
+                                break
+                    # 刷新后重新绑定 lvl（保证后续读取到最新字典）
+                    lvl = self._vp_levels.get(key) or lvl
+            except Exception as e:
+                logging.debug("[NODE][REFRESH][skip] %s", e)
+
+            # 保守转换，避免脏数据触发 ValueError
+            def _safe_floats(xs):
+                out = []
+                for x in (xs or []):
+                    try:
+                        out.append(float(x))
+                    except (TypeError, ValueError):
+                        pass
+                return out
+
+            tp_nodes = _safe_floats(lvl.get("tp_nodes"))
+            sl_nodes = _safe_floats(lvl.get("sl_nodes"))
+            if tp_nodes or sl_nodes or self.USE_ATR_FALLBACK:
+                # 当前方向持仓张数
+                curr = 0.0
+                for p in positions:
+                    if p.get("instId") != inst_id:
+                        continue
+                    if self.pos_mode == "long_short" and (p.get("posSide","") or "").lower() != pos_side:
+                        continue
+                    curr = abs(float(p.get("pos", 0) or 0))
+                    break
+                if curr > 0:
+                    _, _, _, min_sz = self._get_inst_spec(inst_id)
+                    # ← 下方分支同时支持：有节点 → 节点触发；无节点 → ATR 回退触发
+                    entry_adj = float((lvl.get("entry_adj") or 0.0))
+                    # 若仍无有效 entry_adj，则本 tick 跳过 LVN（防止把 0.0 当入场价误触发）
+                    if entry_adj <= 0:
+                        logging.debug("[NODE] missing/zero entry_adj — skip HVN/LVN node triggers this tick; keep VA/ATR fallbacks")
+                        tp_nodes = []
+                        sl_nodes = []
+                    # ==== 计算“含当前杠杆”的最小 ROE 距离（默认 30%）并筛选节点 ====
+                    # 杠杆估计：优先持仓 -> 其次 evt/snapshot -> 兜底 1
+                    lev_est = 1.0
+                    try:
+                        # 尝试从本地持仓读取 lever
+                        lev_est = next(
+                            (float(p.get("lever") or p.get("lev") or 0) or 0)
+                            for p in self.get_positions()
+                            if p.get("instId")==inst_id and (self.pos_mode!="long_short" or p.get("posSide","").lower()==pos_side)
+                        )
+                    except StopIteration:
+                        lev_est = 0.0
+                    except Exception:
+                        lev_est = 0.0
+                    if lev_est <= 0:
+                        try:
+                            lev_est = float(evt.get("lev") or evt.get("leverage") or
+                                            (evt.get("snapshot", {}) or {}).get("lev") or
+                                            (evt.get("snapshot", {}) or {}).get("leverage") or 1.0)
+                        except Exception:
+                            lev_est = 1.0
+                    min_gap_roe = float(self.RG_MIN_ROE_GAP_PCT or 30.0)
+                    # HVN（盈利方向）/ LVN（亏损方向）均要求“相邻节点之间 ≥ min_gap_roe”
+                    hvn_seq = self._select_nodes_with_min_roe_gap(
+                        tp_nodes, entry_adj, pos_side, "tp", lev_est, min_gap_roe
+                    )
+                    lvn_seq = self._select_nodes_with_min_roe_gap(
+                        sl_nodes, entry_adj, pos_side, "sl", lev_est, min_gap_roe
+                    )
+                    # ==== 根据节点数把 cut 百分比平均分摊 ====
+                    n_hvn = len(hvn_seq)
+                    n_lvn = len(lvn_seq)
+                    # 配置：profit_cut_pct / loss_cut_pct 已在 __init__ 读到 → PP_CUT_RATIO / LP_CUT_RATIO
+                    # （有节点时等分；无节点时在下方“ATR 回退”部分按整段比例）
+                    # 支持自定义节点分级比例；否则退回“总比例等分”
+                    if n_hvn > 0:
+                        if self.NODE_TP_CUTS:
+                            tp_rates = self.NODE_TP_CUTS[:n_hvn] + [self.NODE_TP_CUTS[-1]] * max(0, n_hvn - len(self.NODE_TP_CUTS))
+                        else:
+                            tp_rates = [self.PP_CUT_RATIO / n_hvn] * n_hvn
+                    else:
+                        tp_rates = []
+                    if n_lvn > 0:
+                        if self.NODE_SL_CUTS:
+                            sl_rates = self.NODE_SL_CUTS[:n_lvn] + [self.NODE_SL_CUTS[-1]] * max(0, n_lvn - len(self.NODE_SL_CUTS))
+                        else:
+                            sl_rates = [self.LP_CUT_RATIO / n_lvn] * n_lvn
+                    else:
+                        sl_rates = []
+                    # ---- HVN：盈利方向分级减仓（不加滑点；等分 profit_cut_pct） ---- #
+                    if n_hvn > 0 and tp_rates:
+                        tp_hits = min(int(self._node_tp_hits.get(key, 0)), n_hvn)
+                        while tp_hits < n_hvn:
+                            thr = float(hvn_seq[tp_hits])
+                            # 优化 8：保守确认（需越过节点一个确认带宽）
+                            st_atr = self._get_atr_state(inst_id) or {}
+                            atr_pct = float(st_atr.get("atr_pct") or 0.0)
+                            extra_pct = max(self.NODE_CONFIRM_MIN_PCT, self.NODE_CONFIRM_K_ATR * max(0.0, atr_pct))
+                            hi_thr = thr * (1 + extra_pct/100.0)
+                            lo_thr = thr * (1 - extra_pct/100.0)
+                            hit = (mid_px >= hi_thr) if pos_side=="long" else (mid_px <= lo_thr)
+                            if self._under_cooldown(f"NODE:TP:{key}:{tp_hits+1}"):
+                                break
+                            if not hit: break
+                            cut_contracts = max(int(math.ceil(curr * float(tp_rates[tp_hits]))),
+                                                int(math.ceil(min_sz)))
+                            side_param = "buy" if pos_side=="long" else "sell"   # reduce 的“原向”
+                            px = float(mid_px)  # 节点不加滑点
+                         
+                            logging.info("[NODE][HVN][TP] inst=%s %s hit HVN%d/%d @%.8f → reduce %.8f (each=%.2f%%, lev~%.2f)",
+                                         inst_id, pos_side.upper(), tp_hits+1, n_hvn, thr, cut_contracts, float(tp_rates[tp_hits])*100, lev_est)
+                            if mode == "test":
+                                logging.info("[TEST][NODE][TP] Would reduce_position inst=%s size=%s side=%s px=%.8f",
+                                             inst_id, cut_contracts, side_param, px)
+                            else:
+                                self.reduce_position(inst_id, px, cut_contracts, side_param)
+                            tp_hits += 1
+                            self._mark_cooldown(f"NODE:TP:{key}:{tp_hits}")
+                            self._node_tp_hits[key] = tp_hits
+                            curr = max(0.0, curr - cut_contracts)
+                            if curr <= 0: break
+
+                    # ---- LVN：亏损方向分级减仓（不加滑点；等分 loss_cut_pct；多单需先跌破入场价、空单需先上破入场价） ---- #
+                    if n_lvn > 0 and sl_rates and curr > 0:
+                        sl_hits = min(int(self._node_sl_hits.get(key, 0)), n_lvn)
+                        while sl_hits < n_lvn:
+                            thr = float(lvn_seq[sl_hits])
+                            # 优化 8：保守确认 + 冷却
+                            st_atr = self._get_atr_state(inst_id) or {}
+                            atr_pct = float(st_atr.get("atr_pct") or 0.0)
+                            extra_pct = max(self.NODE_CONFIRM_MIN_PCT, self.NODE_CONFIRM_K_ATR * max(0.0, atr_pct))
+                            hi_thr = thr * (1 + extra_pct/100.0)
+                            lo_thr = thr * (1 - extra_pct/100.0)
+                            if pos_side=="long":
+                                guard_ok = (mid_px <= entry_adj) and (mid_px <= lo_thr)
+                            else:
+                                guard_ok = (mid_px >= entry_adj) and (mid_px >= hi_thr)
+                            if self._under_cooldown(f"NODE:SL:{key}:{sl_hits+1}"):
+                                break
+                            if not guard_ok: break
+                            cut_contracts = max(int(math.ceil(curr * float(sl_rates[sl_hits]))),
+                                                int(math.ceil(min_sz)))
+                            side_param = "buy" if pos_side=="long" else "sell"
+                            px = float(mid_px)  # 节点不加滑点
+                            logging.warning("[NODE][LVN][SL] inst=%s %s hit LVN%d/%d @%.8f → reduce %.8f (each=%.2f%%, lev~%.2f)",
+                                            inst_id, pos_side.upper(), sl_hits+1, n_lvn, thr, cut_contracts, float(sl_rates[sl_hits])*100, lev_est)
+                            if mode == "test":
+                                logging.info("[TEST][NODE][SL] Would reduce_position inst=%s size=%s side=%s px=%.8f",
+                                             inst_id, cut_contracts, side_param, px)
+                            else:
+                                self.reduce_position(inst_id, px, cut_contracts, side_param)
+                            sl_hits += 1
+                            self._mark_cooldown(f"NODE:SL:{key}:{sl_hits}")
+                            self._node_sl_hits[key] = sl_hits
+                            curr = max(0.0, curr - cut_contracts)
+                            if curr <= 0: break
+
+                    # ---- ATR 回退：若 HVN 或 LVN 无有效节点，启用 ATR 分档保护 ---- #
+                    # 先尝试 VA/ATR 价格参考（由 RiskGuardian 提供 guards.profit_protect_ref），
+                    # 若不存在则再按 ATR 阶梯回退
+                    guards = (lvl.get("guards") or {})
+                    profit_ref = float(guards.get("profit_protect_ref") or 0.0)
+                    loss_ref   = float(guards.get("loss_protect_ref")   or 0.0)
+                    if curr > 0 and n_hvn == 0 and profit_ref > 0:
+                        # 采用与节点相同的“保守确认带宽”
+                        st_atr = self._get_atr_state(inst_id) or {}
+                        atr_pct = float(st_atr.get("atr_pct") or 0.0)
+                        extra_pct = max(self.NODE_CONFIRM_MIN_PCT, self.NODE_CONFIRM_K_ATR * max(0.0, atr_pct))
+                        hi_thr = profit_ref * (1 + extra_pct/100.0)
+                        lo_thr = profit_ref * (1 - extra_pct/100.0)
+                        hit_ref = (mid_px >= hi_thr) if pos_side=="long" else (mid_px <= lo_thr)
+                        if hit_ref and not self._under_cooldown(f"NODE:TP:VA-FB:{key}:1"):
+                            # 价格点去重（沿用 PP 的 px 去重状态）
+                            k_px = self._pp_key(inst_id, pos_side)
+                            tol_pct = (self._px_tol_pct(inst_id) or float(self.TRIGGER_PX_TOL_PCT or 0.0)) * self._lvl_factor(1)
+                            tol = abs(mid_px) * (tol_pct/100.0)
+                            last_px_trig = self._pp_last_px.get(k_px)
+                            if (last_px_trig is None) or abs(float(mid_px) - float(last_px_trig)) > tol:
+                                cut_contracts = max(int(math.ceil(curr * (self.PP_CUTS[0] if self.PP_CUTS else self.PP_CUT_RATIO))),
+                                                    int(math.ceil(min_sz)))
+                                side_param = "buy" if pos_side=="long" else "sell"
+                                px = float(mid_px)  # VA/ATR 参考不加滑点
+                                logging.info("[NODE][VA-FALLBACK][TP] inst=%s %s cross %.8f (ref=%.8f, band=±%.2f%%) → reduce %s",
+                                             inst_id, pos_side.upper(), mid_px, profit_ref, extra_pct, cut_contracts)
+                                if mode == "test":
+                                    logging.info("[TEST][NODE][VA-FB][TP] Would reduce_position inst=%s size=%s side=%s px=%.8f",
+                                                 inst_id, cut_contracts, side_param, px)
+                                else:
+                                    self.reduce_position(inst_id, px, cut_contracts, side_param)
+                                curr = max(0.0, curr - cut_contracts)
+                                self._pp_last_px[k_px] = mid_px; self._save_profit_guard_px_state()
+                                self._mark_cooldown(f"NODE:TP:VA-FB:{key}:1")
+
+                    if self.USE_ATR_FALLBACK and curr > 0 and entry_adj > 0:
+                        if n_lvn == 0 and loss_ref > 0 and curr > 0:
+                            st_atr = self._get_atr_state(inst_id) or {}
+                            atr_pct = float(st_atr.get("atr_pct") or 0.0)
+                            extra_pct = max(self.NODE_CONFIRM_MIN_PCT, self.NODE_CONFIRM_K_ATR * max(0.0, atr_pct))
+                            hi_thr = loss_ref * (1 + extra_pct/100.0)
+                            lo_thr = loss_ref * (1 - extra_pct/100.0)
+                            if pos_side=="long":
+                                hit_ref = (mid_px <= lo_thr)
+                            else:
+                                hit_ref = (mid_px >= hi_thr)
+                            if hit_ref and not self._under_cooldown(f"NODE:SL:VA-FB:{key}:1"):
+                                # 价格点去重（沿用 LP 的 px 去重状态）
+                                k_px = self._pp_key(inst_id, pos_side)
+                                tol_pct = (self._px_tol_pct(inst_id) or float(self.TRIGGER_PX_TOL_PCT or 0.0)) * self._lvl_factor(1)
+                                tol = abs(mid_px) * (tol_pct/100.0)
+                                last_px_trig = self._lp_last_px.get(k_px)
+                                if (last_px_trig is None) or abs(float(mid_px) - float(last_px_trig)) > tol:
+                                    cut_contracts = max(int(math.ceil(curr * (self.LP_CUTS[0] if self.LP_CUTS else self.LP_CUT_RATIO))),
+                                                        int(math.ceil(min_sz)))
+                                    side_param = "buy" if pos_side=="long" else "sell"
+                                    px = float(mid_px)
+                                    logging.warning("[NODE][VA-FALLBACK][SL] inst=%s %s cross %.8f (ref=%.8f, band=±%.2f%%) → reduce %s",
+                                                    inst_id, pos_side.upper(), mid_px, loss_ref, extra_pct, cut_contracts)
+                                    if mode != "test":
+                                        self.reduce_position(inst_id, px, cut_contracts, side_param)
+                                    self._lp_last_px[k_px] = mid_px; self._save_loss_guard_px_state()
+                                    self._mark_cooldown(f"NODE:SL:VA-FB:{key}:1")
+                        try:
+                            raw = (mid_px - entry_adj) / entry_adj
+                            roe_est = raw * 100.0 * (lev_est if pos_side == "long" else -lev_est)
+                        except Exception:
+                            roe_est = 0.0
+
+                        # === HVN 为空 → 盈利方向 ATR 分档（对应收益保护）===
+                        if n_hvn == 0 and self.PP_STEP_PCT > 0 and self.PP_CUT_RATIO > 0 and roe_est > 0:
+                            k = self._pp_key(inst_id, pos_side)
+                            last = int(self._pp_hits.get(k, 0))
+                            need_lvl = last + 1
+                            dyn_thr = self._pp_step_threshold(float(lev_est or 1), need_lvl, inst_id)
+                            threshold = (dyn_thr if (dyn_thr and dyn_thr > 0) else self.PP_STEP_PCT * need_lvl)
+                            threshold *= (1 - self.PP_TOLERANCE_PCT / 100.0)
+                            if roe_est >= threshold and not self._under_cooldown(f"{k}:PP:FB:lvl{need_lvl}"):
+                                # 价格点去重
+                                tol_pct = (self._px_tol_pct(inst_id) or float(self.TRIGGER_PX_TOL_PCT or 0.0)) * self._lvl_factor(need_lvl)
+                                tol = abs(mid_px) * (tol_pct / 100.0)
+                                last_px_trig = self._pp_last_px.get(k)
+                                if (last_px_trig is None) or abs(float(mid_px) - float(last_px_trig)) > tol:
+                                    cut_ratio_fb = float(self.PP_CUTS[min(len(self.PP_CUTS)-1, max(0, need_lvl-1))]) if self.PP_CUTS else self.PP_CUT_RATIO
+                                    cut_contracts = max(int(math.ceil(curr * cut_ratio_fb)),
+ 
+                                                        int(math.ceil(min_sz)))
+                                    side_param = "buy" if pos_side == "long" else "sell"
+                                    px = mid_px * (1 - self.ENTRY_SLIP) if pos_side == "long" else mid_px * (1 + self.ENTRY_SLIP)
+                                    logging.info("[NODE][ATR-FALLBACK][TP] inst=%s %s ROE=%.2f%% ≥ %.2f%% → reduce %s",
+                                                 inst_id, pos_side.upper(), roe_est, threshold, cut_contracts)
+                                    if mode == "test":
+                                        logging.info("[TEST][NODE][TP] Would reduce_position inst=%s size=%s side=%s px=%.8f",
+                                                     inst_id, cut_contracts, side_param, px)
+                                    else:
+                                        self.reduce_position(inst_id, px, cut_contracts, side_param)
+                                    # 记录层级与触发价
+                                    self._pp_hits[k] = need_lvl
+                                    self._save_profit_guard_state()
+                                    self._pp_last_px[k] = mid_px
+                                    self._save_profit_guard_px_state()
+                                    self._mark_cooldown(f"{k}:PP:FB:lvl{need_lvl}")
+                                    curr = max(0.0, curr - cut_contracts)
+
+                        # === LVN 为空 → 亏损方向 ATR 分档（对应止损保护）===
+                        if n_lvn == 0 and self.LP_STEP_PCT > 0 and self.LP_CUT_RATIO > 0:
+                            loss_est = max(0.0, -roe_est)
+                            if loss_est > 0:
+                                k = self._pp_key(inst_id, pos_side)
+                                last = int(self._lp_hits.get(k, 0))
+                                need_lvl = last + 1
+                                dyn_thr = self._lp_step_threshold(float(lev_est or 1), need_lvl, inst_id)
+                                threshold = (dyn_thr if (dyn_thr and dyn_thr > 0) else self.LP_STEP_PCT * need_lvl)
+                                threshold *= (1 - self.LP_TOLERANCE_PCT / 100.0)
+                                if loss_est >= threshold and not self._under_cooldown(f"{k}:LP:FB:lvl{need_lvl}"):
+                                    tol_pct = (self._px_tol_pct(inst_id) or float(self.TRIGGER_PX_TOL_PCT or 0.0)) * self._lvl_factor(need_lvl)
+                                    tol = abs(mid_px) * (tol_pct / 100.0)
+                                    last_px_trig = self._lp_last_px.get(k)
+                                    if (last_px_trig is None) or abs(float(mid_px) - float(last_px_trig)) > tol:
+                                        cut_ratio_fb = float(self.LP_CUTS[min(len(self.LP_CUTS)-1, max(0, need_lvl-1))]) if self.LP_CUTS else self.LP_CUT_RATIO
+                                        cut_contracts = max(int(math.ceil(curr * cut_ratio_fb)),
+ 
+                                                            int(math.ceil(min_sz)))
+                                        side_param = "buy" if pos_side == "long" else "sell"
+                                        px = float(mid_px)  # LP 回退不加滑点（与上文 LP 分支保持一致）
+                                        logging.warning("[NODE][ATR-FALLBACK][SL] inst=%s %s lossROE=%.2f%% ≥ %.2f%% → reduce %s",
+                                                        inst_id, pos_side.upper(), loss_est, threshold, cut_contracts)
+                                        if mode == "test":
+                                            logging.info("[TEST][NODE][SL] Would reduce_position inst=%s size=%s side=%s px=%.8f",
+                                                         inst_id, cut_contracts, side_param, px)
+                                        else:
+                                            self.reduce_position(inst_id, px, cut_contracts, side_param)
+                                        self._lp_hits[k] = need_lvl
+                                        self._save_loss_guard_state()
+                                        self._lp_last_px[k] = mid_px
+                                        self._save_loss_guard_px_state()           
+                                        self._mark_cooldown(f"{k}:LP:FB:lvl{need_lvl}")
+           
+        # ===================== ⑥ ROE 高水位拖尾止盈（MFE） ===================== #
+        # 说明：当 ROE 达到启动阈值后，记录高水位；若从高水位回撤 ≥ backoff% 则按递进比例减仓
+        try:
+            side_flag2 = (evt.get("side") or "-").upper()
+            pos_side2  = "long" if side_flag2=="LONG" else ("short" if side_flag2=="SHORT" else None)
+            if pos_side2:
+                k = f"{inst_id}:{pos_side2}"
+                # 估算/读取 ROE（沿用上文 snap 逻辑）
+                snap = evt.get("snapshot", {}) or {}
+                roe_now = None
+                unreal = snap.get("unrealizedPnl"); margin = snap.get("marginUsed")
+                if unreal is not None and margin not in (None, "", 0, "0"):
+                    roe_now = 100.0 * float(unreal) / max(1e-12, float(margin))
+                else:
+                    r = snap.get("returnOnEquity")
+                    if r is not None:
+                        r = float(r); roe_now = r*100.0 if abs(r)<=10 else r
+                if roe_now is None:
+                    entry_px = float(snap.get("entryPx") or 0.0)
+                    lev_est  = float(snap.get("lev") or snap.get("leverage") or evt.get("lev") or 1.0)
+                    if entry_px>0 and mid_px>0:
+                        raw = (mid_px - entry_px) / entry_px
+                        roe_now = raw*100.0*(lev_est if pos_side2=="long" else -lev_est)
+                if roe_now and roe_now>0:
+                    pk = max(self._mfe_peak.get(k, 0.0), float(roe_now))
+                    self._mfe_peak[k] = pk
+                    if pk >= self.MFE_START_PCT:
+                        drop = pk - float(roe_now)
+                        need_lvl = int(self._mfe_hits.get(k, 0)) + 1
+                        backoff_need = float(self.MFE_BACKOFF_PCT)  # 可按级数放大：* self._lvl_factor(need_lvl)
+                        # --- B 方案：触发后需“新峰值≥上次触发峰值+ε”才可再武装 ---
+                        gated = bool(self._mfe_gated.get(k, False))
+                        last_peak_trig = float(self._mfe_last_peak_trig.get(k, 0.0))
+                        if gated and pk < (last_peak_trig + self.MFE_REARM_DELTA_PCT):
+                            # 仍未创出足够新的峰值，保持 gated，跳过
+                            return
+                        elif gated and pk >= (last_peak_trig + self.MFE_REARM_DELTA_PCT):
+                            # 达到再武装条件，解除 gated
+                            self._mfe_gated[k] = False
+                        if drop >= backoff_need and not self._under_cooldown(f"MFE:{k}:lvl{need_lvl}"):
+                            # --- A 方案：ROE 去重（随 level 放大容差）---
+                            tol_roe = self.MFE_ROE_TOL_PCT * self._lvl_factor(need_lvl)
+                            last_roe = self._mfe_last_roe.get(k)
+                            if (last_roe is not None) and (abs(float(roe_now) - float(last_roe)) <= tol_roe):
+                                return
+                            # 当前方向持仓
+                            curr = 0.0
+                            for p in positions:
+                                if p.get("instId")!=inst_id: continue
+                                if self.pos_mode=="long_short" and p.get("posSide","").lower()!=pos_side2: continue
+                                curr = abs(float(p.get("pos",0) or 0)); break
+                            if curr>0:
+                                _, _, _, min_sz = self._get_inst_spec(inst_id)
+                                cut_ratio = float(self.MFE_CUTS[min(len(self.MFE_CUTS)-1, max(0, need_lvl-1))])
+                                cut_contracts = max(int(math.ceil(min_sz)), int(math.ceil(curr*cut_ratio)))
+                                side_param = "buy" if pos_side2=="long" else "sell"
+                                px_exec = mid_px * (1 - self.ENTRY_SLIP) if pos_side2=="long" else mid_px * (1 + self.ENTRY_SLIP)
+                                logging.info("[MFE][TRAIL] inst=%s %s peak=%.2f%% now=%.2f%% drop=%.2f%% lvl=%d → reduce %s",
+                                             inst_id, pos_side2.upper(), pk, roe_now, drop, need_lvl, cut_contracts)
+                                if mode=="test":
+                                    logging.info("[TEST][MFE] Would reduce_position inst=%s size=%s side=%s px=%.8f",
+                                                 inst_id, cut_contracts, side_param, px_exec)
+                                else:
+                                    self.reduce_position(inst_id, px_exec, cut_contracts, side_param)
+                                self._mfe_hits[k] = need_lvl
+                                # A+B 状态：记本次触发位置 & 峰值，进入 gated
+                                self._mfe_last_roe[k] = float(roe_now)
+                                self._mfe_last_peak_trig[k] = float(pk)
+                                self._mfe_gated[k] = True
+                                self._mark_cooldown(f"MFE:{k}:lvl{need_lvl}")
+        except Exception as e:
+            logging.debug("[MFE][SKIP] %s", e)
+
+    # ======== 币数量 <-> 合约张数 换算 ======== #
+    def _coin_to_contracts(self, coin_amt: float, ct_val: float, ct_ccy: str, px: float) -> float:
+        """
+        把 coin 数量换算成合约张数（返回 *浮点值*，允许 <1）
+        由调用方决定 round / floor / ceil 方式。
+        """
+        notional = ct_val if ct_ccy.upper() == "USDT" else ct_val * px
+        return coin_amt * px / notional   # 特别注意：如果价格反复在同一位置上涨或回撤，这里注意应该只触发一次

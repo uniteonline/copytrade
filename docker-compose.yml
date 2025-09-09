@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  copytrade:
+    build: .
+    container_name: copytrade
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # 可以用 .env 覆盖
+      - APP_ENTRY=${APP_ENTRY:-trading_strategy.py}
+      - APP_ARGS=${APP_ARGS:- --config /app/config_files/trading_strategy.yaml}
+      - TZ=Asia/Tokyo
+    volumes:
+      # 配置与数据分离，方便持久化与热更新
+      - ./config_files:/app/config_files:ro
+      - ./logs:/app/logs
+      - ./data:/var/lib/copytrade
+    # 如有暴露端口（例如 prometheus/metrics 或 web 界面），打开端口
+    # ports:
+    #   - "8000:8000"
+    depends_on:
+      - rabbitmq
+    # 如需 host 网络（低延迟 WS），可改为：network_mode: "host"
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # 管理界面
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+
+volumes:
+  rabbitmq-data:
