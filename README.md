@@ -16,20 +16,29 @@
 1.安装rabbitmq,python-okx
 
 2.设置时区是utc
+
 sudo timedatectl set-timezone UTC
 
 3.启动队列
+
 sudo rabbitmqctl add_user monitor P%40ssw0rd
+
 sudo rabbitmqctl set_user_tags monitor administrator
+
 sudo rabbitmqctl set_permissions -p / monitor ".*" ".*" ".*"
+
 sudo rabbitmqctl authenticate_user monitor 'P%40ssw0rd'
 
 4.复制service文件下的服务到/etc/systemd/system/
 
 5.启动服务
+
 systemctl restart watcher
+
 systemctl restart indicator
+
 systemctl restart strategy
+
 
 
 
